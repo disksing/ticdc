@@ -20,7 +20,6 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/cdc/entry"
 	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/cdc/puller"
 	"github.com/pingcap/ticdc/cdc/sink"
 	"github.com/pingcap/ticdc/cdc/sink/common"
 	serverConfig "github.com/pingcap/ticdc/pkg/config"
@@ -101,8 +100,7 @@ func (t *tablePipelineImpl) UpdateBarrierTs(ts model.Ts) {
 // AsyncStop tells the pipeline to stop, and returns true is the pipeline is already stopped.
 func (t *tablePipelineImpl) AsyncStop(targetTs model.Ts) bool {
 	err := t.p.SendToFirstNode(pipeline.CommandMessage(&pipeline.Command{
-		Tp:        pipeline.CommandTypeStopAtTs,
-		StoppedTs: targetTs,
+		Tp: pipeline.CommandTypeStop,
 	}))
 	log.Info("send async stop signal to table", zap.Int64("tableID", t.tableID), zap.Uint64("targetTs", targetTs))
 	if err != nil {
@@ -162,7 +160,6 @@ const defaultRunnersSize = 5
 // NewTablePipeline creates a table pipeline
 // TODO(leoppro): implement a mock kvclient to test the table pipeline
 func NewTablePipeline(ctx cdcContext.Context,
-	limitter *puller.BlurResourceLimitter,
 	mounter entry.Mounter,
 	tableID model.TableID,
 	tableName string,
@@ -191,7 +188,7 @@ func NewTablePipeline(ctx cdcContext.Context,
 		runnerSize++
 	}
 	p := pipeline.NewPipeline(ctx, 500*time.Millisecond, runnerSize, defaultOutputChannelSize)
-	p.AppendNode(ctx, "puller", newPullerNode(limitter, tableID, replicaInfo, tableName))
+	p.AppendNode(ctx, "puller", newPullerNode(tableID, replicaInfo, tableName))
 	p.AppendNode(ctx, "sorter", newSorterNode(tableName, tableID, flowController, mounter))
 	p.AppendNode(ctx, "mounter", newMounterNode())
 	if cyclicEnabled {

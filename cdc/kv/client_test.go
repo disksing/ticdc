@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/proto" // nolint:staticcheck
 	"github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -35,6 +35,7 @@ import (
 	"github.com/pingcap/ticdc/cdc/model"
 	"github.com/pingcap/ticdc/pkg/config"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/etcd"
 	"github.com/pingcap/ticdc/pkg/regionspan"
 	"github.com/pingcap/ticdc/pkg/retry"
 	"github.com/pingcap/ticdc/pkg/security"
@@ -43,9 +44,10 @@ import (
 	"github.com/pingcap/ticdc/pkg/util/testleak"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/mockstore/mockcopr"
-	"github.com/tikv/client-go/v2/mockstore/mocktikv"
 	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/testutils"
 	"github.com/tikv/client-go/v2/tikv"
+	"go.etcd.io/etcd/embed"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
@@ -61,30 +63,45 @@ func Test(t *testing.T) {
 }
 
 type clientSuite struct {
+	e *embed.Etcd
 }
 
 var _ = check.Suite(&clientSuite{})
 
+func (s *clientSuite) SetUpTest(c *check.C) {
+	dir := c.MkDir()
+	var err error
+	_, s.e, err = etcd.SetupEmbedEtcd(dir)
+	c.Assert(err, check.IsNil)
+}
+
+func (s *clientSuite) TearDownTest(c *check.C) {
+	s.e.Close()
+}
+
 func (s *clientSuite) TestNewClose(c *check.C) {
 	defer testleak.AfterTest(c)()
-	store := mocktikv.MustNewMVCCStore()
-	defer store.Close() //nolint:errcheck
-	cluster := mocktikv.NewCluster(store)
-	pdCli := mocktikv.NewPDClient(cluster)
-	defer pdCli.Close() //nolint:errcheck
+	defer s.TearDownTest(c)
+	rpcClient, _, pdClient, err := testutils.NewMockTiKV("", nil)
+	c.Assert(err, check.IsNil)
+	defer pdClient.Close()
+	defer rpcClient.Close()
 
-	cli := NewCDCClient(context.Background(), pdCli, nil, &security.Credential{})
-	err := cli.Close()
+	grpcPool := NewGrpcPoolImpl(context.Background(), &security.Credential{})
+	defer grpcPool.Close()
+	cli := NewCDCClient(context.Background(), pdClient, nil, grpcPool)
+	err = cli.Close()
 	c.Assert(err, check.IsNil)
 }
 
 func (s *clientSuite) TestAssembleRowEvent(c *check.C) {
 	defer testleak.AfterTest(c)()
+	defer s.TearDownTest(c)
 	testCases := []struct {
 		regionID       uint64
 		entry          *cdcpb.Event_Row
 		enableOldValue bool
-		expected       *model.RegionFeedEvent
+		expected       model.RegionFeedEvent
 		err            string
 	}{{
 		regionID: 1,
@@ -96,7 +113,7 @@ func (s *clientSuite) TestAssembleRowEvent(c *check.C) {
 			OpType:   cdcpb.Event_Row_PUT,
 		},
 		enableOldValue: false,
-		expected: &model.RegionFeedEvent{
+		expected: model.RegionFeedEvent{
 			RegionID: 1,
 			Val: &model.RawKVEntry{
 				OpType:   model.OpTypePut,
@@ -117,7 +134,7 @@ func (s *clientSuite) TestAssembleRowEvent(c *check.C) {
 			OpType:   cdcpb.Event_Row_DELETE,
 		},
 		enableOldValue: false,
-		expected: &model.RegionFeedEvent{
+		expected: model.RegionFeedEvent{
 			RegionID: 2,
 			Val: &model.RawKVEntry{
 				OpType:   model.OpTypeDelete,
@@ -139,7 +156,7 @@ func (s *clientSuite) TestAssembleRowEvent(c *check.C) {
 			OpType:   cdcpb.Event_Row_PUT,
 		},
 		enableOldValue: false,
-		expected: &model.RegionFeedEvent{
+		expected: model.RegionFeedEvent{
 			RegionID: 3,
 			Val: &model.RawKVEntry{
 				OpType:   model.OpTypePut,
@@ -161,7 +178,7 @@ func (s *clientSuite) TestAssembleRowEvent(c *check.C) {
 			OpType:   cdcpb.Event_Row_PUT,
 		},
 		enableOldValue: true,
-		expected: &model.RegionFeedEvent{
+		expected: model.RegionFeedEvent{
 			RegionID: 4,
 			Val: &model.RawKVEntry{
 				OpType:   model.OpTypePut,
@@ -248,8 +265,7 @@ loop:
 			if e == nil {
 				break loop
 			}
-			err := server.Send(e)
-			s.c.Assert(err, check.IsNil)
+			_ = server.Send(e)
 		case <-notify.notify:
 			break loop
 		}
@@ -301,8 +317,7 @@ func waitRequestID(c *check.C, allocatedID uint64) {
 	c.Assert(err, check.IsNil)
 }
 
-// Use etcdSuite to workaround the race. See comments of `TestConnArray`.
-func (s *etcdSuite) TestConnectOfflineTiKV(c *check.C) {
+func (s *clientSuite) TestConnectOfflineTiKV(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -317,7 +332,7 @@ func (s *etcdSuite) TestConnectOfflineTiKV(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -325,16 +340,19 @@ func (s *etcdSuite) TestConnectOfflineTiKV(c *check.C) {
 	kvStorage := newStorageWithCurVersionCache(tiStore, addr)
 	defer kvStorage.Close() //nolint:errcheck
 
-	cluster.AddStore(1, "localhost:1")
+	invalidStore := "localhost:1"
+	cluster.AddStore(1, invalidStore)
 	cluster.AddStore(2, addr)
 	cluster.Bootstrap(3, []uint64{1, 2}, []uint64{4, 5}, 4)
 
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(context.Background(), pdClient, kvStorage, &security.Credential{})
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(context.Background(), pdClient, kvStorage, grpcPool)
 	defer cdcClient.Close() //nolint:errcheck
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -359,7 +377,7 @@ func (s *etcdSuite) TestConnectOfflineTiKV(c *check.C) {
 		}
 	}
 
-	checkEvent := func(event *model.RegionFeedEvent, ts uint64) {
+	checkEvent := func(event model.RegionFeedEvent, ts uint64) {
 		c.Assert(event.Resolved.ResolvedTs, check.Equals, ts)
 	}
 
@@ -372,7 +390,7 @@ func (s *etcdSuite) TestConnectOfflineTiKV(c *check.C) {
 	ver := kv.NewVersion(ts)
 	c.Assert(err, check.IsNil)
 	ch2 <- makeEvent(ver.Ver)
-	var event *model.RegionFeedEvent
+	var event model.RegionFeedEvent
 	// consume the first resolved ts event, which is sent before region starts
 	<-eventCh
 	select {
@@ -388,10 +406,17 @@ func (s *etcdSuite) TestConnectOfflineTiKV(c *check.C) {
 		c.Fatalf("reconnection not succeed in 1 second")
 	}
 	checkEvent(event, ver.Ver)
+
+	// check gRPC connection active counter is updated correctly
+	bucket, ok := grpcPool.bucketConns[invalidStore]
+	c.Assert(ok, check.IsTrue)
+	empty := bucket.recycle()
+	c.Assert(empty, check.IsTrue)
+
 	cancel()
 }
 
-func (s *etcdSuite) TestRecvLargeMessageSize(c *check.C) {
+func (s *clientSuite) TestRecvLargeMessageSize(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -407,7 +432,7 @@ func (s *etcdSuite) TestRecvLargeMessageSize(c *check.C) {
 	// Cancel first, and then close the server.
 	defer cancel()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	defer pdClient.Close() //nolint:errcheck
@@ -422,8 +447,10 @@ func (s *etcdSuite) TestRecvLargeMessageSize(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -438,7 +465,7 @@ func (s *etcdSuite) TestRecvLargeMessageSize(c *check.C) {
 	initialized := mockInitializedEvent(3 /* regionID */, currentRequestID())
 	ch2 <- initialized
 
-	var event *model.RegionFeedEvent
+	var event model.RegionFeedEvent
 	select {
 	case event = <-eventCh:
 	case <-time.After(time.Second):
@@ -468,13 +495,13 @@ func (s *etcdSuite) TestRecvLargeMessageSize(c *check.C) {
 	select {
 	case event = <-eventCh:
 	case <-time.After(30 * time.Second): // Send 128MB object may costs lots of time.
-		c.Fatalf("recving message takes too long")
+		c.Fatalf("receiving message takes too long")
 	}
 	c.Assert(len(event.Val.Value), check.Equals, largeValSize)
 	cancel()
 }
 
-func (s *etcdSuite) TestHandleError(c *check.C) {
+func (s *clientSuite) TestHandleError(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -496,7 +523,7 @@ func (s *etcdSuite) TestHandleError(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -504,19 +531,28 @@ func (s *etcdSuite) TestHandleError(c *check.C) {
 	kvStorage := newStorageWithCurVersionCache(tiStore, addr1)
 	defer kvStorage.Close() //nolint:errcheck
 
+	region3 := uint64(3)
+	region4 := uint64(4)
+	region5 := uint64(5)
 	cluster.AddStore(1, addr1)
 	cluster.AddStore(2, addr2)
-	cluster.Bootstrap(3, []uint64{1, 2}, []uint64{4, 5}, 4)
+	cluster.Bootstrap(region3, []uint64{1, 2}, []uint64{4, 5}, 4)
+	// split two regions with leader on different TiKV nodes to avoid region
+	// worker exits because of empty maintained region
+	cluster.SplitRaw(region3, region4, []byte("b"), []uint64{6, 7}, 6)
+	cluster.SplitRaw(region4, region5, []byte("c"), []uint64{8, 9}, 9)
 
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := cdcClient.EventFeed(ctx, regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")}, 100, false, lockresolver, isPullInit, eventCh)
+		err := cdcClient.EventFeed(ctx, regionspan.ComparableSpan{Start: []byte("a"), End: []byte("d")}, 100, false, lockresolver, isPullInit, eventCh)
 		c.Assert(errors.Cause(err), check.Equals, context.Canceled)
 		cdcClient.Close() //nolint:errcheck
 	}()
@@ -524,7 +560,7 @@ func (s *etcdSuite) TestHandleError(c *check.C) {
 	// wait request id allocated with: new session, new request
 	waitRequestID(c, baseAllocatedID+1)
 
-	var event *model.RegionFeedEvent
+	var event model.RegionFeedEvent
 	notLeader := &cdcpb.ChangeDataEvent{Events: []*cdcpb.Event{
 		{
 			RegionId:  3,
@@ -625,8 +661,8 @@ consumePreResolvedTs:
 	ch2 <- makeEvent(120)
 	select {
 	case event = <-eventCh:
-	case <-time.After(time.Second):
-		c.Fatalf("reconnection not succeed in 1 second")
+	case <-time.After(3 * time.Second):
+		c.Fatalf("reconnection not succeed in 3 seconds")
 	}
 	c.Assert(event.Resolved, check.NotNil)
 	c.Assert(event.Resolved.ResolvedTs, check.Equals, uint64(120))
@@ -637,7 +673,7 @@ consumePreResolvedTs:
 // TestCompatibilityWithSameConn tests kv client returns an error when TiKV returns
 // the Compatibility error. This error only happens when the same connection to
 // TiKV have different versions.
-func (s *etcdSuite) TestCompatibilityWithSameConn(c *check.C) {
+func (s *clientSuite) TestCompatibilityWithSameConn(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -652,7 +688,7 @@ func (s *etcdSuite) TestCompatibilityWithSameConn(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -666,8 +702,10 @@ func (s *etcdSuite) TestCompatibilityWithSameConn(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	var wg2 sync.WaitGroup
 	wg2.Add(1)
 	go func() {
@@ -697,7 +735,7 @@ func (s *etcdSuite) TestCompatibilityWithSameConn(c *check.C) {
 	cancel()
 }
 
-func (s *etcdSuite) testHandleFeedEvent(c *check.C) {
+func (s *clientSuite) testHandleFeedEvent(c *check.C) {
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
@@ -712,7 +750,7 @@ func (s *etcdSuite) testHandleFeedEvent(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -726,8 +764,10 @@ func (s *etcdSuite) testHandleFeedEvent(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -986,7 +1026,7 @@ func (s *etcdSuite) testHandleFeedEvent(c *check.C) {
 		},
 	}
 
-	expected := []*model.RegionFeedEvent{
+	expected := []model.RegionFeedEvent{
 		{
 			Resolved: &model.ResolvedSpan{
 				Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
@@ -1074,7 +1114,7 @@ func (s *etcdSuite) testHandleFeedEvent(c *check.C) {
 			RegionID: 3,
 		},
 	}
-	multipleExpected := &model.RegionFeedEvent{
+	multipleExpected := model.RegionFeedEvent{
 		Resolved: &model.ResolvedSpan{
 			Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
 			ResolvedTs: 160,
@@ -1110,12 +1150,12 @@ func (s *etcdSuite) testHandleFeedEvent(c *check.C) {
 	cancel()
 }
 
-func (s *etcdSuite) TestHandleFeedEvent(c *check.C) {
+func (s *clientSuite) TestHandleFeedEvent(c *check.C) {
 	defer testleak.AfterTest(c)()
 	s.testHandleFeedEvent(c)
 }
 
-func (s *etcdSuite) TestHandleFeedEventWithWorkerPool(c *check.C) {
+func (s *clientSuite) TestHandleFeedEventWithWorkerPool(c *check.C) {
 	defer testleak.AfterTest(c)()
 	hwm := regionWorkerHighWatermark
 	lwm := regionWorkerLowWatermark
@@ -1130,8 +1170,8 @@ func (s *etcdSuite) TestHandleFeedEventWithWorkerPool(c *check.C) {
 
 // TestStreamSendWithError mainly tests the scenario that the `Send` call of a gPRC
 // stream of kv client meets error, and kv client can clean up the broken stream,
-// establish a new one and recover the normal evend feed processing.
-func (s *etcdSuite) TestStreamSendWithError(c *check.C) {
+// establish a new one and recover the normal event feed processing.
+func (s *clientSuite) TestStreamSendWithError(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1157,7 +1197,7 @@ func (s *etcdSuite) TestStreamSendWithError(c *check.C) {
 		}
 	}
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1171,14 +1211,16 @@ func (s *etcdSuite) TestStreamSendWithError(c *check.C) {
 	cluster.Bootstrap(regionID3, []uint64{1}, []uint64{4}, 4)
 	cluster.SplitRaw(regionID3, regionID4, []byte("b"), []uint64{5}, 5)
 
-	lockresolver := txnutil.NewLockerResolver(kvStorage)
+	lockerResolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := cdcClient.EventFeed(ctx, regionspan.ComparableSpan{Start: []byte("a"), End: []byte("c")}, 100, false, lockresolver, isPullInit, eventCh)
+		err := cdcClient.EventFeed(ctx, regionspan.ComparableSpan{Start: []byte("a"), End: []byte("c")}, 100, false, lockerResolver, isPullInit, eventCh)
 		c.Assert(errors.Cause(err), check.Equals, context.Canceled)
 		cdcClient.Close() //nolint:errcheck
 	}()
@@ -1197,7 +1239,7 @@ func (s *etcdSuite) TestStreamSendWithError(c *check.C) {
 			requestIds.Store(req.RegionId, req.RequestId)
 		}
 	}
-	// Reuse the same listen addresss as server 1
+	// Reuse the same listen address as server 1
 	server2, _ := newMockServiceSpecificAddr(ctx, c, srv2, addr1, wg)
 	defer func() {
 		close(ch2)
@@ -1240,15 +1282,13 @@ func (s *etcdSuite) TestStreamSendWithError(c *check.C) {
 
 	// a hack way to check the goroutine count of region worker is 1
 	buf := make([]byte, 1<<20)
-	stacklen := runtime.Stack(buf, true)
-	stack := string(buf[:stacklen])
+	stackLen := runtime.Stack(buf, true)
+	stack := string(buf[:stackLen])
 	c.Assert(strings.Count(stack, "resolveLock"), check.Equals, 1)
 	c.Assert(strings.Count(stack, "collectWorkpoolError"), check.Equals, 1)
-
-	cancel()
 }
 
-func (s *etcdSuite) testStreamRecvWithError(c *check.C, failpointStr string) {
+func (s *clientSuite) testStreamRecvWithError(c *check.C, failpointStr string) {
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
@@ -1263,7 +1303,7 @@ func (s *etcdSuite) testStreamRecvWithError(c *check.C, failpointStr string) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1283,8 +1323,10 @@ func (s *etcdSuite) testStreamRecvWithError(c *check.C, failpointStr string) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 40)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 40)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1330,7 +1372,7 @@ func (s *etcdSuite) testStreamRecvWithError(c *check.C, failpointStr string) {
 	ch1 <- resolved
 	ch1 <- resolved
 
-	expected := []*model.RegionFeedEvent{
+	expected := []model.RegionFeedEvent{
 		{
 			Resolved: &model.ResolvedSpan{
 				Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
@@ -1347,7 +1389,7 @@ func (s *etcdSuite) testStreamRecvWithError(c *check.C, failpointStr string) {
 		},
 	}
 
-	events := make([]*model.RegionFeedEvent, 0, 2)
+	events := make([]model.RegionFeedEvent, 0, 2)
 eventLoop:
 	for {
 		select {
@@ -1365,7 +1407,7 @@ eventLoop:
 
 // TestStreamRecvWithErrorAndResolvedGoBack mainly tests the scenario that the `Recv` call of a gPRC
 // stream in kv client meets error, and kv client reconnection with tikv with the current tso
-func (s *etcdSuite) TestStreamRecvWithErrorAndResolvedGoBack(c *check.C) {
+func (s *clientSuite) TestStreamRecvWithErrorAndResolvedGoBack(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	if !util.FailpointBuild {
@@ -1395,7 +1437,7 @@ func (s *etcdSuite) TestStreamRecvWithErrorAndResolvedGoBack(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1410,8 +1452,10 @@ func (s *etcdSuite) TestStreamRecvWithErrorAndResolvedGoBack(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1506,13 +1550,13 @@ func (s *etcdSuite) TestStreamRecvWithErrorAndResolvedGoBack(c *check.C) {
 	}}
 	ch1 <- resolved
 
-	received := make([]*model.RegionFeedEvent, 0, 4)
+	received := make([]model.RegionFeedEvent, 0, 4)
 	defer cancel()
 ReceiveLoop:
 	for {
 		select {
-		case event := <-eventCh:
-			if event == nil {
+		case event, ok := <-eventCh:
+			if !ok {
 				break ReceiveLoop
 			}
 			received = append(received, event)
@@ -1534,36 +1578,18 @@ ReceiveLoop:
 // TestStreamRecvWithErrorNormal mainly tests the scenario that the `Recv` call
 // of a gPRC stream in kv client meets a **logical related** error, and kv client
 // logs the error and re-establish new request.
-func (s *etcdSuite) TestStreamRecvWithErrorNormal(c *check.C) {
+func (s *clientSuite) TestStreamRecvWithErrorNormal(c *check.C) {
 	defer testleak.AfterTest(c)()
-
-	// test client v2
-	s.testStreamRecvWithError(c, "1*return(\"injected stream recv error\")")
-
-	// test client v1
-	clientv2 := enableKVClientV2
-	enableKVClientV2 = false
-	defer func() {
-		enableKVClientV2 = clientv2
-	}()
 	s.testStreamRecvWithError(c, "1*return(\"injected stream recv error\")")
 }
 
 // TestStreamRecvWithErrorIOEOF mainly tests the scenario that the `Recv` call
 // of a gPRC stream in kv client meets error io.EOF, and kv client logs the error
 // and re-establish new request
-func (s *etcdSuite) TestStreamRecvWithErrorIOEOF(c *check.C) {
+func (s *clientSuite) TestStreamRecvWithErrorIOEOF(c *check.C) {
 	defer testleak.AfterTest(c)()
 
-	// test client v2
 	s.testStreamRecvWithError(c, "1*return(\"EOF\")")
-
-	// test client v1
-	clientv2 := enableKVClientV2
-	enableKVClientV2 = false
-	defer func() {
-		enableKVClientV2 = clientv2
-	}()
 	s.testStreamRecvWithError(c, "1*return(\"EOF\")")
 }
 
@@ -1572,7 +1598,7 @@ func (s *etcdSuite) TestStreamRecvWithErrorIOEOF(c *check.C) {
 // TiCDC will wait 20s and then retry. This is a common scenario when rolling
 // upgrade a cluster and the new version is not compatible with the old version
 // (upgrade TiCDC before TiKV, since upgrade TiKV often takes much longer).
-func (s *etcdSuite) TestIncompatibleTiKV(c *check.C) {
+func (s *clientSuite) TestIncompatibleTiKV(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1619,7 +1645,7 @@ func (s *etcdSuite) TestIncompatibleTiKV(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: gen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1638,8 +1664,10 @@ func (s *etcdSuite) TestIncompatibleTiKV(c *check.C) {
 	}()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1679,31 +1707,10 @@ func (s *etcdSuite) TestIncompatibleTiKV(c *check.C) {
 	cancel()
 }
 
-// Use etcdSuite for some special reasons, the embed etcd uses zap as the only candidate
-// logger and in the logger initializtion it also initializes the grpclog/loggerv2, which
-// is not a thread-safe operation and it must be called before any gRPC functions
-// ref: https://github.com/grpc/grpc-go/blob/master/grpclog/loggerv2.go#L67-L72
-func (s *etcdSuite) TestConnArray(c *check.C) {
-	defer testleak.AfterTest(c)()
-	defer s.TearDownTest(c)
-	addr := "127.0.0.1:2379"
-	ca, err := newConnArray(context.TODO(), 2, addr, &security.Credential{})
-	c.Assert(err, check.IsNil)
-
-	conn1 := ca.Get()
-	conn2 := ca.Get()
-	c.Assert(conn1, check.Not(check.Equals), conn2)
-
-	conn3 := ca.Get()
-	c.Assert(conn1, check.Equals, conn3)
-
-	ca.Close()
-}
-
 // TestPendingRegionError tests kv client should return an error when receiving
 // a new subscription (the first event of specific region) but the corresponding
 // region is not found in pending regions.
-func (s *etcdSuite) TestNoPendingRegionError(c *check.C) {
+func (s *clientSuite) TestNoPendingRegionError(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1718,7 +1725,7 @@ func (s *etcdSuite) TestNoPendingRegionError(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1732,14 +1739,16 @@ func (s *etcdSuite) TestNoPendingRegionError(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
-	var wg2 sync.WaitGroup
-	wg2.Add(1)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
+
+	wg.Add(1)
 	go func() {
-		defer wg2.Done()
+		defer wg.Done()
 		err := cdcClient.EventFeed(ctx, regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")}, 100, false, lockresolver, isPullInit, eventCh)
-		c.Assert(cerror.ErrNoPendingRegion.Equal(err), check.IsTrue)
+		c.Assert(errors.Cause(err), check.Equals, context.Canceled)
 		cdcClient.Close() //nolint:errcheck
 	}()
 
@@ -1753,12 +1762,30 @@ func (s *etcdSuite) TestNoPendingRegionError(c *check.C) {
 		},
 	}}
 	ch1 <- noPendingRegionEvent
-	wg2.Wait()
+
+	initialized := mockInitializedEvent(3, currentRequestID())
+	ch1 <- initialized
+	ev := <-eventCh
+	c.Assert(ev.Resolved, check.NotNil)
+	c.Assert(ev.Resolved.ResolvedTs, check.Equals, uint64(100))
+
+	resolved := &cdcpb.ChangeDataEvent{Events: []*cdcpb.Event{
+		{
+			RegionId:  3,
+			RequestId: currentRequestID(),
+			Event:     &cdcpb.Event_ResolvedTs{ResolvedTs: 200},
+		},
+	}}
+	ch1 <- resolved
+	ev = <-eventCh
+	c.Assert(ev.Resolved, check.NotNil)
+	c.Assert(ev.Resolved.ResolvedTs, check.Equals, uint64(200))
+
 	cancel()
 }
 
 // TestDropStaleRequest tests kv client should drop an event if its request id is outdated.
-func (s *etcdSuite) TestDropStaleRequest(c *check.C) {
+func (s *clientSuite) TestDropStaleRequest(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1774,7 +1801,7 @@ func (s *etcdSuite) TestDropStaleRequest(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1789,8 +1816,10 @@ func (s *etcdSuite) TestDropStaleRequest(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1821,7 +1850,7 @@ func (s *etcdSuite) TestDropStaleRequest(c *check.C) {
 			Event:     &cdcpb.Event_ResolvedTs{ResolvedTs: 130},
 		},
 	}}
-	expected := []*model.RegionFeedEvent{
+	expected := []model.RegionFeedEvent{
 		{
 			Resolved: &model.ResolvedSpan{
 				Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
@@ -1860,7 +1889,7 @@ func (s *etcdSuite) TestDropStaleRequest(c *check.C) {
 }
 
 // TestResolveLock tests the resolve lock logic in kv client
-func (s *etcdSuite) TestResolveLock(c *check.C) {
+func (s *clientSuite) TestResolveLock(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1876,7 +1905,7 @@ func (s *etcdSuite) TestResolveLock(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1896,8 +1925,10 @@ func (s *etcdSuite) TestResolveLock(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1920,7 +1951,7 @@ func (s *etcdSuite) TestResolveLock(c *check.C) {
 			Event:     &cdcpb.Event_ResolvedTs{ResolvedTs: tso},
 		},
 	}}
-	expected := []*model.RegionFeedEvent{
+	expected := []model.RegionFeedEvent{
 		{
 			Resolved: &model.ResolvedSpan{
 				Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
@@ -1953,7 +1984,7 @@ func (s *etcdSuite) TestResolveLock(c *check.C) {
 	cancel()
 }
 
-func (s *etcdSuite) testEventCommitTsFallback(c *check.C, events []*cdcpb.ChangeDataEvent) {
+func (s *clientSuite) testEventCommitTsFallback(c *check.C, events []*cdcpb.ChangeDataEvent) {
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
@@ -1968,7 +1999,7 @@ func (s *etcdSuite) testEventCommitTsFallback(c *check.C, events []*cdcpb.Change
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -1993,8 +2024,10 @@ func (s *etcdSuite) testEventCommitTsFallback(c *check.C, events []*cdcpb.Change
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	var clientWg sync.WaitGroup
 	clientWg.Add(1)
 	go func() {
@@ -2018,7 +2051,7 @@ func (s *etcdSuite) testEventCommitTsFallback(c *check.C, events []*cdcpb.Change
 }
 
 // TestCommittedFallback tests kv client should panic when receiving a fallback committed event
-func (s *etcdSuite) TestCommittedFallback(c *check.C) {
+func (s *clientSuite) TestCommittedFallback(c *check.C) {
 	defer testleak.AfterTest(c)()
 	events := []*cdcpb.ChangeDataEvent{
 		{Events: []*cdcpb.Event{
@@ -2044,7 +2077,7 @@ func (s *etcdSuite) TestCommittedFallback(c *check.C) {
 }
 
 // TestCommitFallback tests kv client should panic when receiving a fallback commit event
-func (s *etcdSuite) TestCommitFallback(c *check.C) {
+func (s *clientSuite) TestCommitFallback(c *check.C) {
 	defer testleak.AfterTest(c)()
 	events := []*cdcpb.ChangeDataEvent{
 		mockInitializedEvent(3, currentRequestID()),
@@ -2070,7 +2103,7 @@ func (s *etcdSuite) TestCommitFallback(c *check.C) {
 }
 
 // TestDeuplicateRequest tests kv client should panic when meeting a duplicate error
-func (s *etcdSuite) TestDuplicateRequest(c *check.C) {
+func (s *clientSuite) TestDuplicateRequest(c *check.C) {
 	defer testleak.AfterTest(c)()
 	events := []*cdcpb.ChangeDataEvent{
 		{Events: []*cdcpb.Event{
@@ -2088,24 +2121,35 @@ func (s *etcdSuite) TestDuplicateRequest(c *check.C) {
 	s.testEventCommitTsFallback(c, events)
 }
 
-// TestEventAfterFeedStop tests kv client can drop events sent after region feed is stopped
-func (s *etcdSuite) TestEventAfterFeedStop(c *check.C) {
+// testEventAfterFeedStop tests kv client can drop events sent after region feed is stopped
+// TODO: testEventAfterFeedStop is not stable, re-enable it after it is stable
+// nolint:unused
+func (s *clientSuite) testEventAfterFeedStop(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
 
+	server1Stopped := make(chan struct{})
 	ch1 := make(chan *cdcpb.ChangeDataEvent, 10)
 	srv1 := newMockChangeDataService(c, ch1)
 	server1, addr1 := newMockService(ctx, c, srv1, wg)
+	srv1.recvLoop = func(server cdcpb.ChangeData_EventFeedServer) {
+		defer func() {
+			close(ch1)
+			server1.Stop()
+			server1Stopped <- struct{}{}
+		}()
+		for {
+			_, err := server.Recv()
+			if err != nil {
+				log.Error("mock server error", zap.Error(err))
+				break
+			}
+		}
+	}
 
-	defer func() {
-		close(ch1)
-		server1.Stop()
-		wg.Wait()
-	}()
-
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2128,8 +2172,10 @@ func (s *etcdSuite) TestEventAfterFeedStop(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2189,15 +2235,47 @@ func (s *etcdSuite) TestEventAfterFeedStop(c *check.C) {
 	ch1 <- initialized
 	ch1 <- resolved
 
+	<-server1Stopped
+
+	var requestID uint64
+	ch2 := make(chan *cdcpb.ChangeDataEvent, 10)
+	srv2 := newMockChangeDataService(c, ch2)
+	// Reuse the same listen addresss as server 1 to simulate TiKV handles the
+	// gRPC stream terminate and reconnect.
+	server2, _ := newMockServiceSpecificAddr(ctx, c, srv2, addr1, wg)
+	srv2.recvLoop = func(server cdcpb.ChangeData_EventFeedServer) {
+		for {
+			req, err := server.Recv()
+			if err != nil {
+				log.Error("mock server error", zap.Error(err))
+				return
+			}
+			atomic.StoreUint64(&requestID, req.RequestId)
+		}
+	}
+	defer func() {
+		close(ch2)
+		server2.Stop()
+		wg.Wait()
+	}()
+
+	err = retry.Run(time.Millisecond*500, 10, func() error {
+		if atomic.LoadUint64(&requestID) > 0 {
+			return nil
+		}
+		return errors.New("waiting for kv client requests received by server")
+	})
+	log.Info("retry check request id", zap.Error(err))
+	c.Assert(err, check.IsNil)
+
 	// wait request id allocated with: new session, 2 * new request
-	waitRequestID(c, baseAllocatedID+2)
 	committedClone.Events[0].RequestId = currentRequestID()
 	initializedClone.Events[0].RequestId = currentRequestID()
-	ch1 <- committedClone
-	ch1 <- initializedClone
-	ch1 <- resolvedClone
+	ch2 <- committedClone
+	ch2 <- initializedClone
+	ch2 <- resolvedClone
 
-	expected := []*model.RegionFeedEvent{
+	expected := []model.RegionFeedEvent{
 		{
 			Resolved: &model.ResolvedSpan{
 				Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
@@ -2242,7 +2320,7 @@ func (s *etcdSuite) TestEventAfterFeedStop(c *check.C) {
 	cancel()
 }
 
-func (s *etcdSuite) TestOutOfRegionRangeEvent(c *check.C) {
+func (s *clientSuite) TestOutOfRegionRangeEvent(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2258,7 +2336,7 @@ func (s *etcdSuite) TestOutOfRegionRangeEvent(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2272,8 +2350,10 @@ func (s *etcdSuite) TestOutOfRegionRangeEvent(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2393,7 +2473,7 @@ func (s *etcdSuite) TestOutOfRegionRangeEvent(c *check.C) {
 		},
 	}
 
-	expected := []*model.RegionFeedEvent{
+	expected := []model.RegionFeedEvent{
 		{
 			Resolved: &model.ResolvedSpan{
 				Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
@@ -2451,6 +2531,7 @@ func (s *etcdSuite) TestOutOfRegionRangeEvent(c *check.C) {
 
 func (s *clientSuite) TestSingleRegionInfoClone(c *check.C) {
 	defer testleak.AfterTest(c)()
+	defer s.TearDownTest(c)
 	sri := newSingleRegionInfo(
 		tikv.RegionVerID{},
 		regionspan.ComparableSpan{Start: []byte("a"), End: []byte("c")},
@@ -2467,7 +2548,7 @@ func (s *clientSuite) TestSingleRegionInfoClone(c *check.C) {
 
 // TestResolveLockNoCandidate tests the resolved ts manager can work normally
 // when no region exceeds reslove lock interval, that is what candidate means.
-func (s *etcdSuite) TestResolveLockNoCandidate(c *check.C) {
+func (s *clientSuite) TestResolveLockNoCandidate(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2483,7 +2564,7 @@ func (s *etcdSuite) TestResolveLockNoCandidate(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2500,8 +2581,10 @@ func (s *etcdSuite) TestResolveLockNoCandidate(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2553,7 +2636,7 @@ func (s *etcdSuite) TestResolveLockNoCandidate(c *check.C) {
 // 2. We delay the kv client to re-create a new region request by 500ms via failpoint.
 // 3. Before new region request is fired, simulate kv client `stream.Recv` returns an error, the stream
 //    handler will signal region worker to exit, which will evict all active region states then.
-func (s *etcdSuite) TestFailRegionReentrant(c *check.C) {
+func (s *clientSuite) TestFailRegionReentrant(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2569,7 +2652,7 @@ func (s *etcdSuite) TestFailRegionReentrant(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2592,8 +2675,10 @@ func (s *etcdSuite) TestFailRegionReentrant(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage.(tikv.Storage))
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage.(tikv.Storage), &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage.(tikv.Storage), grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2636,15 +2721,9 @@ func (s *etcdSuite) TestFailRegionReentrant(c *check.C) {
 //    has been deleted in step-3, so it will create new stream but fails because
 //    of unstable TiKV store, at this point, the kv client should handle with the
 //    pending region correctly.
-func (s *etcdSuite) TestClientV1UnlockRangeReentrant(c *check.C) {
+func (s *clientSuite) TestClientV1UnlockRangeReentrant(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
-
-	clientv2 := enableKVClientV2
-	enableKVClientV2 = false
-	defer func() {
-		enableKVClientV2 = clientv2
-	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
@@ -2653,7 +2732,7 @@ func (s *etcdSuite) TestClientV1UnlockRangeReentrant(c *check.C) {
 	srv1 := newMockChangeDataService(c, ch1)
 	server1, addr1 := newMockService(ctx, c, srv1, wg)
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2677,8 +2756,10 @@ func (s *etcdSuite) TestClientV1UnlockRangeReentrant(c *check.C) {
 	}()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2699,22 +2780,12 @@ func (s *etcdSuite) TestClientV1UnlockRangeReentrant(c *check.C) {
 
 // TestClientErrNoPendingRegion has the similar procedure with TestClientV1UnlockRangeReentrant
 // The difference is the delay injected point for region 2
-func (s *etcdSuite) TestClientErrNoPendingRegion(c *check.C) {
+func (s *clientSuite) TestClientErrNoPendingRegion(c *check.C) {
 	defer testleak.AfterTest(c)()
-	clientv2 := enableKVClientV2
-	enableKVClientV2 = false
-	defer func() {
-		enableKVClientV2 = clientv2
-	}()
-	// test for client v1
-	s.testClientErrNoPendingRegion(c)
-
-	enableKVClientV2 = true
-	// test for client v2
 	s.testClientErrNoPendingRegion(c)
 }
 
-func (s *etcdSuite) testClientErrNoPendingRegion(c *check.C) {
+func (s *clientSuite) testClientErrNoPendingRegion(c *check.C) {
 	defer s.TearDownTest(c)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2724,7 +2795,7 @@ func (s *etcdSuite) testClientErrNoPendingRegion(c *check.C) {
 	srv1 := newMockChangeDataService(c, ch1)
 	server1, addr1 := newMockService(ctx, c, srv1, wg)
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2751,8 +2822,10 @@ func (s *etcdSuite) testClientErrNoPendingRegion(c *check.C) {
 	}()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2779,7 +2852,7 @@ func (s *etcdSuite) testClientErrNoPendingRegion(c *check.C) {
 }
 
 // TestKVClientForceReconnect force reconnect gRPC stream can work
-func (s *etcdSuite) testKVClientForceReconnect(c *check.C) {
+func (s *clientSuite) testKVClientForceReconnect(c *check.C) {
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
 
@@ -2802,7 +2875,7 @@ func (s *etcdSuite) testKVClientForceReconnect(c *check.C) {
 		}
 	}
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2825,8 +2898,10 @@ func (s *etcdSuite) testKVClientForceReconnect(c *check.C) {
 
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2890,7 +2965,7 @@ func (s *etcdSuite) testKVClientForceReconnect(c *check.C) {
 	}}
 	ch2 <- resolved
 
-	expected := &model.RegionFeedEvent{
+	expected := model.RegionFeedEvent{
 		Resolved: &model.ResolvedSpan{
 			Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("c")},
 			ResolvedTs: 135,
@@ -2915,27 +2990,17 @@ eventLoop:
 	cancel()
 }
 
-func (s *etcdSuite) TestKVClientForceReconnect(c *check.C) {
+func (s *clientSuite) TestKVClientForceReconnect(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 
-	clientv2 := enableKVClientV2
-	defer func() {
-		enableKVClientV2 = clientv2
-	}()
-
-	// test kv client v1
-	enableKVClientV2 = false
-	s.testKVClientForceReconnect(c)
-
-	enableKVClientV2 = true
 	s.testKVClientForceReconnect(c)
 }
 
 // TestConcurrentProcessRangeRequest when region range request channel is full,
 // the kv client can process it correctly without deadlock. This is more likely
 // to happen when region split and merge frequently and large stale requests exist.
-func (s *etcdSuite) TestConcurrentProcessRangeRequest(c *check.C) {
+func (s *clientSuite) TestConcurrentProcessRangeRequest(c *check.C) {
 	defer testleak.AfterTest(c)()
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2961,7 +3026,7 @@ func (s *etcdSuite) TestConcurrentProcessRangeRequest(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -2982,8 +3047,10 @@ func (s *etcdSuite) TestConcurrentProcessRangeRequest(c *check.C) {
 	}()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 100)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 100)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -3056,9 +3123,8 @@ checkEvent:
 // TestEvTimeUpdate creates a new event feed, send N committed events every 100ms,
 // use failpoint to set reconnect interval to 1s, the last event time of region
 // should be updated correctly and no reconnect is triggered
-func (s *etcdSuite) TestEvTimeUpdate(c *check.C) {
+func (s *clientSuite) TestEvTimeUpdate(c *check.C) {
 	defer testleak.AfterTest(c)()
-
 	defer s.TearDownTest(c)
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
@@ -3073,7 +3139,7 @@ func (s *etcdSuite) TestEvTimeUpdate(c *check.C) {
 		wg.Wait()
 	}()
 
-	rpcClient, cluster, pdClient, err := mocktikv.NewTiKVAndPDClient("", mockcopr.NewCoprRPCHandler())
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
 	c.Assert(err, check.IsNil)
 	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
 	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
@@ -3096,8 +3162,10 @@ func (s *etcdSuite) TestEvTimeUpdate(c *check.C) {
 	baseAllocatedID := currentRequestID()
 	lockresolver := txnutil.NewLockerResolver(kvStorage)
 	isPullInit := &mockPullerInit{}
-	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, &security.Credential{})
-	eventCh := make(chan *model.RegionFeedEvent, 10)
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -3133,7 +3201,7 @@ func (s *etcdSuite) TestEvTimeUpdate(c *check.C) {
 		time.Sleep(time.Millisecond * 100)
 	}
 
-	expected := []*model.RegionFeedEvent{
+	expected := []model.RegionFeedEvent{
 		{
 			Resolved: &model.ResolvedSpan{
 				Span:       regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")},
@@ -3167,5 +3235,84 @@ func (s *etcdSuite) TestEvTimeUpdate(c *check.C) {
 		}
 	}
 
+	cancel()
+}
+
+// TestRegionWorkerExitWhenIsIdle tests region worker can exit, and cancel gRPC
+// stream automatically when it is idle.
+func (s *clientSuite) TestRegionWorkerExitWhenIsIdle(c *check.C) {
+	defer testleak.AfterTest(c)()
+	defer s.TearDownTest(c)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+
+	server1Stopped := make(chan struct{})
+	ch1 := make(chan *cdcpb.ChangeDataEvent, 10)
+	srv1 := newMockChangeDataService(c, ch1)
+	server1, addr1 := newMockService(ctx, c, srv1, wg)
+	srv1.recvLoop = func(server cdcpb.ChangeData_EventFeedServer) {
+		defer func() {
+			close(ch1)
+			server1.Stop()
+			server1Stopped <- struct{}{}
+		}()
+		for {
+			_, err := server.Recv()
+			if err != nil {
+				log.Error("mock server error", zap.Error(err))
+				break
+			}
+		}
+	}
+
+	rpcClient, cluster, pdClient, err := testutils.NewMockTiKV("", mockcopr.NewCoprRPCHandler())
+	c.Assert(err, check.IsNil)
+	pdClient = &mockPDClient{Client: pdClient, versionGen: defaultVersionGen}
+	tiStore, err := tikv.NewTestTiKVStore(rpcClient, pdClient, nil, nil, 0)
+	c.Assert(err, check.IsNil)
+	kvStorage := newStorageWithCurVersionCache(tiStore, addr1)
+	defer kvStorage.Close() //nolint:errcheck
+
+	regionID := uint64(3)
+	cluster.AddStore(1, addr1)
+	cluster.Bootstrap(regionID, []uint64{1}, []uint64{4}, 4)
+
+	baseAllocatedID := currentRequestID()
+	lockresolver := txnutil.NewLockerResolver(kvStorage)
+	isPullInit := &mockPullerInit{}
+	grpcPool := NewGrpcPoolImpl(ctx, &security.Credential{})
+	defer grpcPool.Close()
+	cdcClient := NewCDCClient(ctx, pdClient, kvStorage, grpcPool)
+	eventCh := make(chan model.RegionFeedEvent, 10)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := cdcClient.EventFeed(ctx, regionspan.ComparableSpan{Start: []byte("a"), End: []byte("b")}, 100, false, lockresolver, isPullInit, eventCh)
+		c.Assert(errors.Cause(err), check.Equals, context.Canceled)
+		cdcClient.Close() //nolint:errcheck
+	}()
+
+	// wait request id allocated with: new session, new request
+	waitRequestID(c, baseAllocatedID+1)
+	// an error event will mark the corresponding region feed as stopped
+	epochNotMatch := &cdcpb.ChangeDataEvent{Events: []*cdcpb.Event{
+		{
+			RegionId:  3,
+			RequestId: currentRequestID(),
+			Event: &cdcpb.Event_Error{
+				Error: &cdcpb.Error{
+					EpochNotMatch: &errorpb.EpochNotMatch{},
+				},
+			},
+		},
+	}}
+	ch1 <- epochNotMatch
+
+	select {
+	case <-server1Stopped:
+	case <-time.After(time.Second):
+		c.Error("stream is not terminated by cdc kv client")
+	}
 	cancel()
 }

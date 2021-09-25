@@ -116,6 +116,11 @@ error = '''
 changefeed in abnormal state: %s, replication status: %+v
 '''
 
+["CDC:ErrChangefeedUpdateRefused"]
+error = '''
+changefeed update error: %s
+'''
+
 ["CDC:ErrCheckClusterVersionFromPD"]
 error = '''
 failed to request PD
@@ -541,6 +546,11 @@ error = '''
 owner encountered inconsistent state. report a bug if this happens frequently. %s
 '''
 
+["CDC:ErrOwnerNotFound"]
+error = '''
+owner not found
+'''
+
 ["CDC:ErrOwnerSortDir"]
 error = '''
 owner sort dir
@@ -746,6 +756,11 @@ error = '''
 this api supports POST method only
 '''
 
+["CDC:ErrTableIneligible"]
+error = '''
+some tables are not eligible to replicate(%v), if you want to ignore these tables, please set ignore_ineligible_table to true
+'''
+
 ["CDC:ErrTableListenReplicated"]
 error = '''
 A table(%d) is being replicated by at least two processors(%s, %s), please report a bug
@@ -754,6 +769,11 @@ A table(%d) is being replicated by at least two processors(%s, %s), please repor
 ["CDC:ErrTableProcessorStoppedSafely"]
 error = '''
 table processor stopped safely
+'''
+
+["CDC:ErrTargetTsBeforeStartTs"]
+error = '''
+fail to create changefeed because target-ts %d is earlier than start-ts %d
 '''
 
 ["CDC:ErrTaskPositionNotExists"]
@@ -826,11 +846,6 @@ error = '''
 waiting processor to handle the operation finished timeout
 '''
 
-["CDC:ErrWorkerPoolEmptyTask"]
-error = '''
-workerpool received an empty task, please report a bug
-'''
-
 ["CDC:ErrWorkerPoolHandleCancelled"]
 error = '''
 workerpool handle is cancelled
@@ -849,6 +864,11 @@ wrong table info in unflatten, table id %d, index table id: %d
 ["ErrConflictingFileLocks"]
 error = '''
 file lock conflict: %s
+'''
+
+["ErrRequestForwardErr"]
+error = '''
+request forward error, an request can only forward to owner one time 
 '''
 
 ["ErrSortDirLockError"]

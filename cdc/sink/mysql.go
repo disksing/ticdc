@@ -92,9 +92,10 @@ type mysqlSink struct {
 	filter *filter.Filter
 	cyclic *cyclic.Cyclic
 
-	txnCache   *common.UnresolvedTxnCache
-	workers    []*mysqlSinkWorker
-	resolvedTs uint64
+	txnCache      *common.UnresolvedTxnCache
+	workers       []*mysqlSinkWorker
+	resolvedTs    uint64
+	maxResolvedTs uint64
 
 	execWaitNotifier *notify.Notifier
 	resolvedNotifier *notify.Notifier
@@ -116,7 +117,14 @@ func (s *mysqlSink) EmitRowChangedEvents(ctx context.Context, rows ...*model.Row
 	return nil
 }
 
+// FlushRowChangedEvents will flushes all received events, we don't allow mysql
+// sink to receive events before resolving
 func (s *mysqlSink) FlushRowChangedEvents(ctx context.Context, resolvedTs uint64) (uint64, error) {
+	if atomic.LoadUint64(&s.maxResolvedTs) < resolvedTs {
+		atomic.StoreUint64(&s.maxResolvedTs, resolvedTs)
+	}
+	// resolvedTs can be fallen back, such as a new table is added into this sink
+	// with a smaller start-ts
 	atomic.StoreUint64(&s.resolvedTs, resolvedTs)
 	s.resolvedNotifier.Notify()
 
@@ -160,12 +168,13 @@ func (s *mysqlSink) flushRowChangedEvents(ctx context.Context, receiver *notify.
 			continue
 		}
 
-		if !config.NewReplicaImpl && s.cyclic != nil {
-			// Filter rows if it is origined from downstream.
+		if s.cyclic != nil {
+			// Filter rows if it is origin from downstream.
 			skippedRowCount := cyclic.FilterAndReduceTxns(
 				resolvedTxnsMap, s.cyclic.FilterReplicaID(), s.cyclic.ReplicaID())
 			s.statistics.SubRowsCount(skippedRowCount)
 		}
+
 		s.dispatchAndExecTxns(ctx, resolvedTxnsMap)
 		for _, worker := range s.workers {
 			atomic.StoreUint64(&worker.checkpointTs, resolvedTs)
@@ -189,6 +198,7 @@ func (s *mysqlSink) EmitDDLEvent(ctx context.Context, ddl *model.DDLEvent) error
 		)
 		return cerror.ErrDDLEventIgnored.GenWithStackByArgs()
 	}
+	s.statistics.AddDDLCount()
 	err := s.execDDLWithMaxRetries(ctx, ddl)
 	return errors.Trace(err)
 }
@@ -223,30 +233,32 @@ func (s *mysqlSink) execDDL(ctx context.Context, ddl *model.DDLEvent) error {
 		}
 		failpoint.Return(nil)
 	})
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
-	}
-
-	if shouldSwitchDB {
-		_, err = tx.ExecContext(ctx, "USE "+quotes.QuoteName(ddl.TableInfo.Schema)+";")
+	err := s.statistics.RecordDDLExecution(func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				log.Error("Failed to rollback", zap.Error(err))
+			return err
+		}
+
+		if shouldSwitchDB {
+			_, err = tx.ExecContext(ctx, "USE "+quotes.QuoteName(ddl.TableInfo.Schema)+";")
+			if err != nil {
+				if rbErr := tx.Rollback(); rbErr != nil {
+					log.Error("Failed to rollback", zap.Error(err))
+				}
+				return err
 			}
-			return cerror.WrapError(cerror.ErrMySQLTxnError, err)
 		}
-	}
 
-	if _, err = tx.ExecContext(ctx, ddl.Query); err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			log.Error("Failed to rollback", zap.String("sql", ddl.Query), zap.Error(err))
+		if _, err = tx.ExecContext(ctx, ddl.Query); err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Error("Failed to rollback", zap.String("sql", ddl.Query), zap.Error(err))
+			}
+			return err
 		}
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
-	}
 
-	if err = tx.Commit(); err != nil {
+		return tx.Commit()
+	})
+	if err != nil {
 		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
 	}
 
@@ -653,7 +665,7 @@ func (s *mysqlSink) createSinkWorkers(ctx context.Context) error {
 }
 
 func (s *mysqlSink) notifyAndWaitExec(ctx context.Context) {
-	s.broadcastFinishTxn(ctx)
+	s.broadcastFinishTxn()
 	s.execWaitNotifier.Notify()
 	done := make(chan struct{})
 	go func() {
@@ -670,7 +682,7 @@ func (s *mysqlSink) notifyAndWaitExec(ctx context.Context) {
 	}
 }
 
-func (s *mysqlSink) broadcastFinishTxn(ctx context.Context) {
+func (s *mysqlSink) broadcastFinishTxn() {
 	// Note all data txn is sent via channel, the control txn must come after all
 	// data txns in each worker. So after worker receives the control txn, it can
 	// flush txns immediately and call wait group done once.
@@ -861,11 +873,52 @@ func (w *mysqlSinkWorker) cleanup() {
 	}
 }
 
-func (s *mysqlSink) Close() error {
+func (s *mysqlSink) Close(ctx context.Context) error {
 	s.execWaitNotifier.Close()
 	s.resolvedNotifier.Close()
 	err := s.db.Close()
 	return cerror.WrapError(cerror.ErrMySQLConnectionError, err)
+}
+
+func (s *mysqlSink) Barrier(ctx context.Context) error {
+	warnDuration := 3 * time.Minute
+	ticker := time.NewTicker(warnDuration)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.Trace(ctx.Err())
+		case <-ticker.C:
+			log.Warn("Barrier doesn't return in time, may be stuck",
+				zap.Uint64("resolved-ts", atomic.LoadUint64(&s.maxResolvedTs)),
+				zap.Uint64("checkpoint-ts", s.checkpointTs()))
+		default:
+			maxResolvedTs := atomic.LoadUint64(&s.maxResolvedTs)
+			if s.checkpointTs() >= maxResolvedTs {
+				return nil
+			}
+			checkpointTs, err := s.FlushRowChangedEvents(ctx, maxResolvedTs)
+			if err != nil {
+				return err
+			}
+			if checkpointTs >= maxResolvedTs {
+				return nil
+			}
+			// short sleep to avoid cpu spin
+			time.Sleep(time.Second)
+		}
+	}
+}
+
+func (s *mysqlSink) checkpointTs() uint64 {
+	checkpointTs := atomic.LoadUint64(&s.resolvedTs)
+	for _, worker := range s.workers {
+		workerCheckpointTs := atomic.LoadUint64(&worker.checkpointTs)
+		if workerCheckpointTs < checkpointTs {
+			checkpointTs = workerCheckpointTs
+		}
+	}
+	return checkpointTs
 }
 
 func logDMLTxnErr(err error) error {

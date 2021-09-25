@@ -15,6 +15,7 @@ package pipeline
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,7 +88,11 @@ func (s *mockSink) EmitCheckpointTs(ctx context.Context, ts uint64) error {
 	panic("unreachable")
 }
 
-func (s *mockSink) Close() error {
+func (s *mockSink) Close(ctx context.Context) error {
+	return nil
+}
+
+func (s *mockSink) Barrier(ctx context.Context) error {
 	return nil
 }
 
@@ -100,6 +105,20 @@ func (s *mockSink) Check(c *check.C, expected []struct {
 
 func (s *mockSink) Reset() {
 	s.received = s.received[:0]
+}
+
+type mockCloseControlSink struct {
+	mockSink
+	closeCh chan interface{}
+}
+
+func (s *mockCloseControlSink) Close(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closeCh:
+		return nil
+	}
 }
 
 type outputSuite struct{}
@@ -119,7 +138,7 @@ func (s *outputSuite) TestStatus(c *check.C) {
 
 	// test stop at targetTs
 	node := newSinkNode(&mockSink{}, 0, 10, &mockFlowController{})
-	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, nil, nil)), check.IsNil)
+	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, pipeline.Message{}, nil)), check.IsNil)
 	c.Assert(node.Status(), check.Equals, TableStatusInitializing)
 
 	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx, pipeline.BarrierMessage(20), nil)), check.IsNil)
@@ -145,7 +164,7 @@ func (s *outputSuite) TestStatus(c *check.C) {
 
 	// test the stop at ts command
 	node = newSinkNode(&mockSink{}, 0, 10, &mockFlowController{})
-	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, nil, nil)), check.IsNil)
+	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, pipeline.Message{}, nil)), check.IsNil)
 	c.Assert(node.Status(), check.Equals, TableStatusInitializing)
 
 	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx, pipeline.BarrierMessage(20), nil)), check.IsNil)
@@ -155,19 +174,20 @@ func (s *outputSuite) TestStatus(c *check.C) {
 		pipeline.PolymorphicEventMessage(&model.PolymorphicEvent{CRTs: 2, RawKV: &model.RawKVEntry{OpType: model.OpTypeResolved}, Row: &model.RowChangedEvent{}}), nil)), check.IsNil)
 	c.Assert(node.Status(), check.Equals, TableStatusRunning)
 
-	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx,
-		pipeline.CommandMessage(&pipeline.Command{Tp: pipeline.CommandTypeStopAtTs, StoppedTs: 6}), nil)), check.IsNil)
-	c.Assert(node.Status(), check.Equals, TableStatusRunning)
+	err = node.Receive(pipeline.MockNodeContext4Test(ctx,
+		pipeline.CommandMessage(&pipeline.Command{Tp: pipeline.CommandTypeStop}), nil))
+	c.Assert(cerrors.ErrTableProcessorStoppedSafely.Equal(err), check.IsTrue)
+	c.Assert(node.Status(), check.Equals, TableStatusStopped)
 
 	err = node.Receive(pipeline.MockNodeContext4Test(ctx,
 		pipeline.PolymorphicEventMessage(&model.PolymorphicEvent{CRTs: 7, RawKV: &model.RawKVEntry{OpType: model.OpTypeResolved}, Row: &model.RowChangedEvent{}}), nil))
 	c.Assert(cerrors.ErrTableProcessorStoppedSafely.Equal(err), check.IsTrue)
 	c.Assert(node.Status(), check.Equals, TableStatusStopped)
-	c.Assert(node.CheckpointTs(), check.Equals, uint64(6))
+	c.Assert(node.CheckpointTs(), check.Equals, uint64(2))
 
 	// test the stop at ts command is after then resolvedTs and checkpointTs is greater than stop ts
 	node = newSinkNode(&mockSink{}, 0, 10, &mockFlowController{})
-	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, nil, nil)), check.IsNil)
+	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, pipeline.Message{}, nil)), check.IsNil)
 	c.Assert(node.Status(), check.Equals, TableStatusInitializing)
 
 	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx, pipeline.BarrierMessage(20), nil)), check.IsNil)
@@ -177,15 +197,54 @@ func (s *outputSuite) TestStatus(c *check.C) {
 		pipeline.PolymorphicEventMessage(&model.PolymorphicEvent{CRTs: 7, RawKV: &model.RawKVEntry{OpType: model.OpTypeResolved}, Row: &model.RowChangedEvent{}}), nil)), check.IsNil)
 	c.Assert(node.Status(), check.Equals, TableStatusRunning)
 
-	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx,
-		pipeline.CommandMessage(&pipeline.Command{Tp: pipeline.CommandTypeStopAtTs, StoppedTs: 6}), nil)), check.IsNil)
-	c.Assert(node.Status(), check.Equals, TableStatusRunning)
+	err = node.Receive(pipeline.MockNodeContext4Test(ctx,
+		pipeline.CommandMessage(&pipeline.Command{Tp: pipeline.CommandTypeStop}), nil))
+	c.Assert(cerrors.ErrTableProcessorStoppedSafely.Equal(err), check.IsTrue)
+	c.Assert(node.Status(), check.Equals, TableStatusStopped)
 
 	err = node.Receive(pipeline.MockNodeContext4Test(ctx,
 		pipeline.PolymorphicEventMessage(&model.PolymorphicEvent{CRTs: 7, RawKV: &model.RawKVEntry{OpType: model.OpTypeResolved}, Row: &model.RowChangedEvent{}}), nil))
 	c.Assert(cerrors.ErrTableProcessorStoppedSafely.Equal(err), check.IsTrue)
 	c.Assert(node.Status(), check.Equals, TableStatusStopped)
 	c.Assert(node.CheckpointTs(), check.Equals, uint64(7))
+}
+
+// TestStopStatus tests the table status of a pipeline is not set to stopped
+// until the underlying sink is closed
+func (s *outputSuite) TestStopStatus(c *check.C) {
+	defer testleak.AfterTest(c)()
+	ctx := cdcContext.NewContext(context.Background(), &cdcContext.GlobalVars{})
+	ctx = cdcContext.WithChangefeedVars(ctx, &cdcContext.ChangefeedVars{
+		ID: "changefeed-id-test-status",
+		Info: &model.ChangeFeedInfo{
+			StartTs: oracle.GoTimeToTS(time.Now()),
+			Config:  config.GetDefaultReplicaConfig(),
+		},
+	})
+
+	closeCh := make(chan interface{}, 1)
+	node := newSinkNode(&mockCloseControlSink{mockSink: mockSink{}, closeCh: closeCh}, 0, 100, &mockFlowController{})
+	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, pipeline.Message{}, nil)), check.IsNil)
+	c.Assert(node.Status(), check.Equals, TableStatusInitializing)
+	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx,
+		pipeline.PolymorphicEventMessage(&model.PolymorphicEvent{CRTs: 2, RawKV: &model.RawKVEntry{OpType: model.OpTypeResolved}, Row: &model.RowChangedEvent{}}), nil)), check.IsNil)
+	c.Assert(node.Status(), check.Equals, TableStatusRunning)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// This will block until sink Close returns
+		err := node.Receive(pipeline.MockNodeContext4Test(ctx,
+			pipeline.CommandMessage(&pipeline.Command{Tp: pipeline.CommandTypeStop}), nil))
+		c.Assert(cerrors.ErrTableProcessorStoppedSafely.Equal(err), check.IsTrue)
+		c.Assert(node.Status(), check.Equals, TableStatusStopped)
+	}()
+	// wait to ensure stop message is sent to the sink node
+	time.Sleep(time.Millisecond * 50)
+	c.Assert(node.Status(), check.Equals, TableStatusRunning)
+	closeCh <- struct{}{}
+	wg.Wait()
 }
 
 func (s *outputSuite) TestManyTs(c *check.C) {
@@ -200,7 +259,7 @@ func (s *outputSuite) TestManyTs(c *check.C) {
 	})
 	sink := &mockSink{}
 	node := newSinkNode(sink, 0, 10, &mockFlowController{})
-	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, nil, nil)), check.IsNil)
+	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, pipeline.Message{}, nil)), check.IsNil)
 	c.Assert(node.Status(), check.Equals, TableStatusInitializing)
 
 	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx,
@@ -257,7 +316,7 @@ func (s *outputSuite) TestSplitUpdateEventWhenEnableOldValue(c *check.C) {
 	})
 	sink := &mockSink{}
 	node := newSinkNode(sink, 0, 10, &mockFlowController{})
-	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, nil, nil)), check.IsNil)
+	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, pipeline.Message{}, nil)), check.IsNil)
 
 	// nil row.
 	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx,
@@ -316,7 +375,7 @@ func (s *outputSuite) TestSplitUpdateEventWhenDisableOldValue(c *check.C) {
 	})
 	sink := &mockSink{}
 	node := newSinkNode(sink, 0, 10, &mockFlowController{})
-	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, nil, nil)), check.IsNil)
+	c.Assert(node.Init(pipeline.MockNodeContext4Test(ctx, pipeline.Message{}, nil)), check.IsNil)
 
 	// nil row.
 	c.Assert(node.Receive(pipeline.MockNodeContext4Test(ctx,

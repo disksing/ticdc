@@ -52,7 +52,7 @@ const (
 	StateFinished FeedState = "finished"
 )
 
-// ToInt return a int for each `FeedState`, only use this for metrics.
+// ToInt return an int for each `FeedState`, only use this for metrics.
 func (s FeedState) ToInt() int {
 	switch s {
 	case StateNormal:
@@ -70,6 +70,24 @@ func (s FeedState) ToInt() int {
 	}
 	// -1 for unknown feed state
 	return -1
+}
+
+// IsNeeded return true if the given feedState matches the listState.
+func (s FeedState) IsNeeded(need string) bool {
+	if need == "all" {
+		return true
+	}
+	if need == "" {
+		switch s {
+		case StateNormal:
+			return true
+		case StateStopped:
+			return true
+		case StateFailed:
+			return true
+		}
+	}
+	return need == string(s)
 }
 
 const (

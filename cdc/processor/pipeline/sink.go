@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultSyncResolvedBatch = 1024
+	defaultSyncResolvedBatch = 64
 )
 
 // TableStatus is status of the table pipeline
@@ -100,6 +100,20 @@ func (n *sinkNode) Init(ctx pipeline.NodeContext) error {
 	return nil
 }
 
+// stop is called when sink receives a stop command or checkpointTs reaches targetTs.
+// In this method, the builtin table sink will be closed by calling `Close`, and
+// no more events can be sent to this sink node afterwards.
+func (n *sinkNode) stop(ctx pipeline.NodeContext) (err error) {
+	// table stopped status must be set after underlying sink is closed
+	defer n.status.Store(TableStatusStopped)
+	err = n.sink.Close(ctx)
+	if err != nil {
+		return
+	}
+	err = cerror.ErrTableProcessorStoppedSafely.GenWithStackByArgs()
+	return
+}
+
 func (n *sinkNode) flushSink(ctx pipeline.NodeContext, resolvedTs model.Ts) (err error) {
 	defer func() {
 		if err != nil {
@@ -107,13 +121,7 @@ func (n *sinkNode) flushSink(ctx pipeline.NodeContext, resolvedTs model.Ts) (err
 			return
 		}
 		if n.checkpointTs >= n.targetTs {
-			n.status.Store(TableStatusStopped)
-			err = n.sink.Close()
-			if err != nil {
-				err = errors.Trace(err)
-				return
-			}
-			err = cerror.ErrTableProcessorStoppedSafely.GenWithStackByArgs()
+			err = n.stop(ctx)
 		}
 	}()
 	if resolvedTs > n.barrierTs {
@@ -125,7 +133,7 @@ func (n *sinkNode) flushSink(ctx pipeline.NodeContext, resolvedTs model.Ts) (err
 	if resolvedTs <= n.checkpointTs {
 		return nil
 	}
-	if err := n.flushRow2Sink(ctx); err != nil {
+	if err := n.emitRow2Sink(ctx); err != nil {
 		return errors.Trace(err)
 	}
 	checkpointTs, err := n.sink.FlushRowChangedEvents(ctx, resolvedTs)
@@ -143,6 +151,7 @@ func (n *sinkNode) flushSink(ctx pipeline.NodeContext, resolvedTs model.Ts) (err
 
 func (n *sinkNode) emitEvent(ctx pipeline.NodeContext, event *model.PolymorphicEvent) error {
 	if event == nil || event.Row == nil {
+		log.Warn("skip emit empty rows", zap.Any("event", event))
 		return nil
 	}
 
@@ -154,77 +163,119 @@ func (n *sinkNode) emitEvent(ctx pipeline.NodeContext, event *model.PolymorphicE
 	// and after enable old value internally by default(but disable in the configuration).
 	// We need to handle the update event to be compatible with the old format.
 	if !config.EnableOldValue && colLen != 0 && preColLen != 0 && colLen == preColLen {
-		handleKeyCount := 0
-		equivalentHandleKeyCount := 0
-		for i := range event.Row.Columns {
-			if event.Row.Columns[i].Flag.IsHandleKey() && event.Row.PreColumns[i].Flag.IsHandleKey() {
-				handleKeyCount++
-				colValueString := model.ColumnValueString(event.Row.Columns[i].Value)
-				preColValueString := model.ColumnValueString(event.Row.PreColumns[i].Value)
-				if colValueString == preColValueString {
-					equivalentHandleKeyCount++
-				}
+		if shouldSplitUpdateEvent(event) {
+			deleteEvent, insertEvent, err := splitUpdateEvent(event)
+			if err != nil {
+				return errors.Trace(err)
 			}
-		}
-
-		// If the handle key columns are not updated, PreColumns is directly ignored.
-		if handleKeyCount == equivalentHandleKeyCount {
+			// NOTICE: Please do not change the order, the delete event always comes before the insert event.
+			n.eventBuffer = append(n.eventBuffer, deleteEvent, insertEvent)
+		} else {
+			// If the handle key columns are not updated, PreColumns is directly ignored.
 			event.Row.PreColumns = nil
 			n.eventBuffer = append(n.eventBuffer, event)
-		} else {
-			// If there is an update to handle key columns,
-			// we need to split the event into two events to be compatible with the old format.
-			// NOTICE: Here we don't need a full deep copy because our two events need Columns and PreColumns respectively,
-			// so it won't have an impact and no more full deep copy wastes memory.
-			deleteEvent := *event
-			deleteEventRow := *event.Row
-			deleteEventRowKV := *event.RawKV
-			deleteEvent.Row = &deleteEventRow
-			deleteEvent.RawKV = &deleteEventRowKV
-
-			deleteEvent.Row.Columns = nil
-			for i := range deleteEvent.Row.PreColumns {
-				// NOTICE: Only the handle key pre column is retained in the delete event.
-				if !deleteEvent.Row.PreColumns[i].Flag.IsHandleKey() {
-					deleteEvent.Row.PreColumns[i] = nil
-				}
-			}
-			// Align with the old format if old value disabled.
-			deleteEvent.Row.TableInfoVersion = 0
-			n.eventBuffer = append(n.eventBuffer, &deleteEvent)
-
-			insertEvent := *event
-			insertEventRow := *event.Row
-			insertEventRowKV := *event.RawKV
-			insertEvent.Row = &insertEventRow
-			insertEvent.RawKV = &insertEventRowKV
-
-			// NOTICE: clean up pre cols for insert event.
-			insertEvent.Row.PreColumns = nil
-			n.eventBuffer = append(n.eventBuffer, &insertEvent)
 		}
 	} else {
 		n.eventBuffer = append(n.eventBuffer, event)
 	}
 
 	if len(n.eventBuffer) >= defaultSyncResolvedBatch {
-		if err := n.flushRow2Sink(ctx); err != nil {
+		if err := n.emitRow2Sink(ctx); err != nil {
 			return errors.Trace(err)
 		}
 	}
 	return nil
 }
 
-func (n *sinkNode) flushRow2Sink(ctx pipeline.NodeContext) error {
+// shouldSplitUpdateEvent determines if the split event is needed to align the old format based on
+// whether the handle key column has been modified.
+// If the handle key column is modified,
+// we need to use splitUpdateEvent to split the update event into a delete and an insert event.
+func shouldSplitUpdateEvent(updateEvent *model.PolymorphicEvent) bool {
+	// nil event will never be split.
+	if updateEvent == nil {
+		return false
+	}
+
+	handleKeyCount := 0
+	equivalentHandleKeyCount := 0
+	for i := range updateEvent.Row.Columns {
+		if updateEvent.Row.Columns[i].Flag.IsHandleKey() && updateEvent.Row.PreColumns[i].Flag.IsHandleKey() {
+			handleKeyCount++
+			colValueString := model.ColumnValueString(updateEvent.Row.Columns[i].Value)
+			preColValueString := model.ColumnValueString(updateEvent.Row.PreColumns[i].Value)
+			if colValueString == preColValueString {
+				equivalentHandleKeyCount++
+			}
+		}
+	}
+
+	// If the handle key columns are not updated, so we do **not** need to split the event row.
+	return !(handleKeyCount == equivalentHandleKeyCount)
+}
+
+// splitUpdateEvent splits an update event into a delete and an insert event.
+func splitUpdateEvent(updateEvent *model.PolymorphicEvent) (*model.PolymorphicEvent, *model.PolymorphicEvent, error) {
+	if updateEvent == nil {
+		return nil, nil, errors.New("nil event cannot be split")
+	}
+
+	// If there is an update to handle key columns,
+	// we need to split the event into two events to be compatible with the old format.
+	// NOTICE: Here we don't need a full deep copy because our two events need Columns and PreColumns respectively,
+	// so it won't have an impact and no more full deep copy wastes memory.
+	deleteEvent := *updateEvent
+	deleteEventRow := *updateEvent.Row
+	deleteEventRowKV := *updateEvent.RawKV
+	deleteEvent.Row = &deleteEventRow
+	deleteEvent.RawKV = &deleteEventRowKV
+
+	deleteEvent.Row.Columns = nil
+	for i := range deleteEvent.Row.PreColumns {
+		// NOTICE: Only the handle key pre column is retained in the delete event.
+		if !deleteEvent.Row.PreColumns[i].Flag.IsHandleKey() {
+			deleteEvent.Row.PreColumns[i] = nil
+		}
+	}
+	// Align with the old format if old value disabled.
+	deleteEvent.Row.TableInfoVersion = 0
+
+	insertEvent := *updateEvent
+	insertEventRow := *updateEvent.Row
+	insertEventRowKV := *updateEvent.RawKV
+	insertEvent.Row = &insertEventRow
+	insertEvent.RawKV = &insertEventRowKV
+	// NOTICE: clean up pre cols for insert event.
+	insertEvent.Row.PreColumns = nil
+
+	return &deleteEvent, &insertEvent, nil
+}
+
+// clear event buffer and row buffer.
+// Also, it unrefs data that are holded by buffers.
+func (n *sinkNode) clearBuffers() {
+	// Do not hog memory.
+	if cap(n.rowBuffer) > defaultSyncResolvedBatch {
+		n.rowBuffer = make([]*model.RowChangedEvent, 0, defaultSyncResolvedBatch)
+	} else {
+		for i := range n.rowBuffer {
+			n.rowBuffer[i] = nil
+		}
+		n.rowBuffer = n.rowBuffer[:0]
+	}
+
+	if cap(n.eventBuffer) > defaultSyncResolvedBatch {
+		n.eventBuffer = make([]*model.PolymorphicEvent, 0, defaultSyncResolvedBatch)
+	} else {
+		for i := range n.eventBuffer {
+			n.eventBuffer[i] = nil
+		}
+		n.eventBuffer = n.eventBuffer[:0]
+	}
+}
+
+func (n *sinkNode) emitRow2Sink(ctx pipeline.NodeContext) error {
 	for _, ev := range n.eventBuffer {
-		err := ev.WaitPrepare(ctx)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if ev.Row == nil {
-			continue
-		}
-		ev.Row.ReplicaID = ev.ReplicaID
 		n.rowBuffer = append(n.rowBuffer, ev.Row)
 	}
 	failpoint.Inject("ProcessorSyncResolvedPreEmit", func() {
@@ -236,13 +287,15 @@ func (n *sinkNode) flushRow2Sink(ctx pipeline.NodeContext) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	n.rowBuffer = n.rowBuffer[:0]
-	n.eventBuffer = n.eventBuffer[:0]
+	n.clearBuffers()
 	return nil
 }
 
 // Receive receives the message from the previous node
 func (n *sinkNode) Receive(ctx pipeline.NodeContext) error {
+	if n.status == TableStatusStopped {
+		return cerror.ErrTableProcessorStoppedSafely.GenWithStackByArgs()
+	}
 	msg := ctx.Message()
 	switch msg.Tp {
 	case pipeline.MessageTypePolymorphicEvent:
@@ -268,13 +321,8 @@ func (n *sinkNode) Receive(ctx pipeline.NodeContext) error {
 			return errors.Trace(err)
 		}
 	case pipeline.MessageTypeCommand:
-		if msg.Command.Tp == pipeline.CommandTypeStopAtTs {
-			if msg.Command.StoppedTs < n.checkpointTs {
-				log.Warn("the stopped ts is less than the checkpoint ts, "+
-					"the table pipeline can't be stopped accurately, will be stopped soon",
-					zap.Uint64("stoppedTs", msg.Command.StoppedTs), zap.Uint64("checkpointTs", n.checkpointTs))
-			}
-			n.targetTs = msg.Command.StoppedTs
+		if msg.Command.Tp == pipeline.CommandTypeStop {
+			return n.stop(ctx)
 		}
 	case pipeline.MessageTypeBarrier:
 		n.barrierTs = msg.BarrierTs
@@ -288,5 +336,5 @@ func (n *sinkNode) Receive(ctx pipeline.NodeContext) error {
 func (n *sinkNode) Destroy(ctx pipeline.NodeContext) error {
 	n.status.Store(TableStatusStopped)
 	n.flowController.Abort()
-	return n.sink.Close()
+	return n.sink.Close(ctx)
 }

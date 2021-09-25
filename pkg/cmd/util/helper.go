@@ -14,9 +14,24 @@
 package util
 
 import (
+	"context"
+	"encoding/json"
 	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 
+	"github.com/BurntSushi/toml"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
+	cmdconetxt "github.com/pingcap/ticdc/pkg/cmd/context"
+	"github.com/pingcap/ticdc/pkg/etcd"
+	"github.com/pingcap/ticdc/pkg/logutil"
+	"github.com/pingcap/ticdc/pkg/version"
+	"github.com/spf13/cobra"
+	"go.uber.org/zap"
+	"golang.org/x/net/http/httpproxy"
 )
 
 // Endpoint schemes.
@@ -24,6 +39,81 @@ const (
 	HTTP  = "http"
 	HTTPS = "https"
 )
+
+// InitCmd initializes the logger, the default context and returns its cancel function.
+func InitCmd(cmd *cobra.Command, logCfg *logutil.Config) context.CancelFunc {
+	// Init log.
+	err := logutil.InitLogger(logCfg)
+	if err != nil {
+		cmd.Printf("init logger error %v\n", errors.ErrorStack(err))
+		os.Exit(1)
+	}
+	log.Info("init log", zap.String("file", logCfg.File), zap.String("level", logCfg.Level))
+
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		sig := <-sc
+		log.Info("got signal to exit", zap.Stringer("signal", sig))
+		cancel()
+	}()
+
+	cmdconetxt.SetDefaultContext(ctx)
+
+	return cancel
+}
+
+// LogHTTPProxies logs HTTP proxy relative environment variables.
+func LogHTTPProxies() {
+	fields := findProxyFields()
+	if len(fields) > 0 {
+		log.Info("using proxy config", fields...)
+	}
+}
+
+func findProxyFields() []zap.Field {
+	proxyCfg := httpproxy.FromEnvironment()
+	fields := make([]zap.Field, 0, 3)
+	if proxyCfg.HTTPProxy != "" {
+		fields = append(fields, zap.String("http_proxy", proxyCfg.HTTPProxy))
+	}
+	if proxyCfg.HTTPSProxy != "" {
+		fields = append(fields, zap.String("https_proxy", proxyCfg.HTTPSProxy))
+	}
+	if proxyCfg.NoProxy != "" {
+		fields = append(fields, zap.String("no_proxy", proxyCfg.NoProxy))
+	}
+	return fields
+}
+
+// StrictDecodeFile decodes the toml file strictly. If any item in confFile file is not mapped
+// into the Config struct, issue an error and stop the server from starting.
+func StrictDecodeFile(path, component string, cfg interface{}) error {
+	metaData, err := toml.DecodeFile(path, cfg)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	if undecoded := metaData.Undecoded(); len(undecoded) > 0 {
+		var b strings.Builder
+		for i, item := range undecoded {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(item.String())
+		}
+		err = errors.Errorf("component %s's config file %s contained unknown configuration options: %s",
+			component, path, b.String())
+	}
+
+	return errors.Trace(err)
+}
 
 // VerifyPdEndpoint verifies whether the pd endpoint is a valid http or https URL.
 // The certificate is required when using https.
@@ -46,4 +136,42 @@ func VerifyPdEndpoint(pdEndpoint string, useTLS bool) error {
 		}
 	}
 	return nil
+}
+
+// JSONPrint will output the data in JSON format.
+func JSONPrint(cmd *cobra.Command, v interface{}) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	cmd.Printf("%s\n", data)
+	return nil
+}
+
+// VerifyAndGetTiCDCClusterVersion verifies and gets the version of ticdc.
+// If it is an incompatible version, an error is returned.
+func VerifyAndGetTiCDCClusterVersion(
+	ctx context.Context, cdcEtcdCli *etcd.CDCEtcdClient,
+) (version.TiCDCClusterVersion, error) {
+	_, captureInfos, err := cdcEtcdCli.GetCaptures(ctx)
+	if err != nil {
+		return version.TiCDCClusterVersion{}, err
+	}
+
+	cdcClusterVer, err := version.GetTiCDCClusterVersion(captureInfos)
+	if err != nil {
+		return version.TiCDCClusterVersion{}, err
+	}
+
+	// Check TiCDC cluster version.
+	isUnknownVersion, err := version.CheckTiCDCClusterVersion(cdcClusterVer)
+	if err != nil {
+		return version.TiCDCClusterVersion{}, err
+	}
+
+	if isUnknownVersion {
+		return version.TiCDCClusterVersion{}, errors.NewNoStackError("TiCDC cluster is unknown, please start TiCDC cluster")
+	}
+
+	return cdcClusterVer, nil
 }

@@ -31,7 +31,6 @@ import (
 	tablepipeline "github.com/pingcap/ticdc/cdc/processor/pipeline"
 	"github.com/pingcap/ticdc/cdc/puller"
 	"github.com/pingcap/ticdc/cdc/sink"
-	"github.com/pingcap/ticdc/pkg/config"
 	cdcContext "github.com/pingcap/ticdc/pkg/context"
 	"github.com/pingcap/ticdc/pkg/cyclic/mark"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
@@ -46,9 +45,6 @@ import (
 )
 
 const (
-	// defaultMemBufferCapacity is the default memory buffer per change feed.
-	defaultMemBufferCapacity int64 = 10 * 1024 * 1024 * 1024 // 10G
-
 	schemaStorageGCLag = time.Minute * 20
 
 	backoffBaseDelayInMs = 5
@@ -58,11 +54,10 @@ const (
 type processor struct {
 	changefeedID model.ChangeFeedID
 	captureInfo  *model.CaptureInfo
-	changefeed   *model.ChangefeedReactorState
+	changefeed   *orchestrator.ChangefeedReactorState
 
 	tables map[model.TableID]tablepipeline.TablePipeline
 
-	limitter      *puller.BlurResourceLimitter
 	schemaStorage entry.SchemaStorage
 	filter        *filter.Filter
 	mounter       entry.Mounter
@@ -89,7 +84,6 @@ func newProcessor(ctx cdcContext.Context) *processor {
 	changefeedID := ctx.ChangefeedVars().ID
 	advertiseAddr := ctx.GlobalVars().CaptureInfo.AdvertiseAddr
 	p := &processor{
-		limitter:     puller.NewBlurResourceLimmter(defaultMemBufferCapacity),
 		tables:       make(map[model.TableID]tablepipeline.TablePipeline),
 		errCh:        make(chan error, 1),
 		changefeedID: changefeedID,
@@ -120,7 +114,7 @@ func newProcessor4Test(ctx cdcContext.Context,
 // Tick implements the `orchestrator.State` interface
 // the `state` parameter is sent by the etcd worker, the `state` must be a snapshot of KVs in etcd
 // The main logic of processor is in this function, including the calculation of many kinds of ts, maintain table pipeline, error handling, etc.
-func (p *processor) Tick(ctx cdcContext.Context, state *model.ChangefeedReactorState) (orchestrator.ReactorState, error) {
+func (p *processor) Tick(ctx cdcContext.Context, state *orchestrator.ChangefeedReactorState) (orchestrator.ReactorState, error) {
 	p.changefeed = state
 	state.CheckCaptureAlive(ctx.GlobalVars().CaptureInfo.ID)
 	ctx = cdcContext.WithChangefeedVars(ctx, &cdcContext.ChangefeedVars{
@@ -162,7 +156,7 @@ func (p *processor) Tick(ctx cdcContext.Context, state *model.ChangefeedReactorS
 	return state, cerror.ErrReactorFinished.GenWithStackByArgs()
 }
 
-func (p *processor) tick(ctx cdcContext.Context, state *model.ChangefeedReactorState) (nextState orchestrator.ReactorState, err error) {
+func (p *processor) tick(ctx cdcContext.Context, state *orchestrator.ChangefeedReactorState) (nextState orchestrator.ReactorState, err error) {
 	p.changefeed = state
 	if !p.checkChangefeedNormal() {
 		return nil, cerror.ErrAdminStopProcessor.GenWithStackByArgs()
@@ -182,18 +176,10 @@ func (p *processor) tick(ctx cdcContext.Context, state *model.ChangefeedReactorS
 	if err := p.checkTablesNum(ctx); err != nil {
 		return nil, errors.Trace(err)
 	}
-	if err := p.handlePosition(); err != nil {
-		return nil, errors.Trace(err)
-	}
-	if err := p.pushResolvedTs2Table(); err != nil {
-		return nil, errors.Trace(err)
-	}
-	if err := p.handleWorkload(); err != nil {
-		return nil, errors.Trace(err)
-	}
-	if err := p.doGCSchemaStorage(); err != nil {
-		return nil, errors.Trace(err)
-	}
+	p.handlePosition()
+	p.pushResolvedTs2Table()
+	p.handleWorkload()
+	p.doGCSchemaStorage()
 	return p.changefeed, nil
 }
 
@@ -300,7 +286,8 @@ func (p *processor) lazyInitImpl(ctx cdcContext.Context) error {
 		return errors.Trace(err)
 	}
 	checkpointTs := p.changefeed.Info.GetCheckpointTs(p.changefeed.Status)
-	p.sinkManager = sink.NewManager(stdCtx, s, errCh, checkpointTs)
+	captureAddr := ctx.GlobalVars().CaptureInfo.AdvertiseAddr
+	p.sinkManager = sink.NewManager(stdCtx, s, errCh, checkpointTs, captureAddr, p.changefeedID)
 	p.initialized = true
 	log.Info("run processor", cdcContext.ZapFieldCapture(ctx), cdcContext.ZapFieldChangefeed(ctx))
 	return nil
@@ -358,7 +345,6 @@ func (p *processor) handleTableOperation(ctx cdcContext.Context) error {
 					cdcContext.ZapFieldChangefeed(ctx), zap.Int64("tableID", tableID))
 				patchOperation(tableID, func(operation *model.TableOperation) error {
 					operation.Status = model.OperFinished
-					operation.Done = true
 					return nil
 				})
 				continue
@@ -387,7 +373,6 @@ func (p *processor) handleTableOperation(ctx cdcContext.Context) error {
 				patchOperation(tableID, func(operation *model.TableOperation) error {
 					operation.BoundaryTs = table.CheckpointTs()
 					operation.Status = model.OperFinished
-					operation.Done = true
 					return nil
 				})
 				table.Cancel()
@@ -434,7 +419,6 @@ func (p *processor) handleTableOperation(ctx cdcContext.Context) error {
 				if table.ResolvedTs() >= localResolvedTs && localResolvedTs >= globalResolvedTs {
 					patchOperation(tableID, func(operation *model.TableOperation) error {
 						operation.Status = model.OperFinished
-						operation.Done = true
 						return nil
 					})
 					log.Debug("Operation done signal received",
@@ -454,11 +438,10 @@ func (p *processor) createAndDriveSchemaStorage(ctx cdcContext.Context) (entry.S
 	kvStorage := ctx.GlobalVars().KVStorage
 	ddlspans := []regionspan.Span{regionspan.GetDDLSpan(), regionspan.GetAddIndexDDLSpan()}
 	checkpointTs := p.changefeed.Info.GetCheckpointTs(p.changefeed.Status)
-	conf := config.GetGlobalServerConfig()
 	ddlPuller := puller.NewPuller(
 		ctx,
 		ctx.GlobalVars().PDClient,
-		conf.Security,
+		ctx.GlobalVars().GrpcPool,
 		ctx.GlobalVars().KVStorage,
 		checkpointTs, ddlspans, false)
 	meta, err := kv.GetSnapshotMeta(kvStorage, checkpointTs)
@@ -516,7 +499,9 @@ func (p *processor) sendError(err error) {
 	select {
 	case p.errCh <- err:
 	default:
-		log.Error("processor receives redundant error", zap.Error(err))
+		if errors.Cause(err) != context.Canceled {
+			log.Error("processor receives redundant error", zap.Error(err))
+		}
 	}
 }
 
@@ -567,7 +552,7 @@ func (p *processor) checkTablesNum(ctx cdcContext.Context) error {
 }
 
 // handlePosition calculates the local resolved ts and local checkpoint ts
-func (p *processor) handlePosition() error {
+func (p *processor) handlePosition() {
 	minResolvedTs := uint64(math.MaxUint64)
 	if p.schemaStorage != nil {
 		minResolvedTs = p.schemaStorage.ResolvedTs()
@@ -615,11 +600,10 @@ func (p *processor) handlePosition() error {
 			return position, true, nil
 		})
 	}
-	return nil
 }
 
 // handleWorkload calculates the workload of all tables
-func (p *processor) handleWorkload() error {
+func (p *processor) handleWorkload() {
 	p.changefeed.PatchTaskWorkload(p.captureInfo.ID, func(workloads model.TaskWorkload) (model.TaskWorkload, bool, error) {
 		changed := false
 		if workloads == nil {
@@ -639,16 +623,14 @@ func (p *processor) handleWorkload() error {
 		}
 		return workloads, changed, nil
 	})
-	return nil
 }
 
 // pushResolvedTs2Table sends global resolved ts to all the table pipelines.
-func (p *processor) pushResolvedTs2Table() error {
+func (p *processor) pushResolvedTs2Table() {
 	resolvedTs := p.changefeed.Status.ResolvedTs
 	for _, table := range p.tables {
 		table.UpdateBarrierTs(resolvedTs)
 	}
-	return nil
 }
 
 // addTable creates a new table pipeline and adds it to the `p.tables`
@@ -734,7 +716,6 @@ func (p *processor) createTablePipelineImpl(ctx cdcContext.Context, tableID mode
 	sink := p.sinkManager.CreateTableSink(tableID, replicaInfo.StartTs)
 	table := tablepipeline.NewTablePipeline(
 		ctx,
-		p.limitter,
 		p.mounter,
 		tableID,
 		tableNameStr,
@@ -764,17 +745,16 @@ func (p *processor) createTablePipelineImpl(ctx cdcContext.Context, tableID mode
 }
 
 // doGCSchemaStorage trigger the schema storage GC
-func (p *processor) doGCSchemaStorage() error {
+func (p *processor) doGCSchemaStorage() {
 	if p.schemaStorage == nil {
 		// schemaStorage is nil only in test
-		return nil
+		return
 	}
 	// Delay GC to accommodate pullers starting from a startTs that's too small
 	// TODO fix startTs problem and remove GC delay, or use other mechanism that prevents the problem deterministically
 	gcTime := oracle.GetTimeFromTS(p.changefeed.Status.CheckpointTs).Add(-schemaStorageGCLag)
 	gcTs := oracle.ComposeTS(gcTime.Unix(), 0)
 	p.schemaStorage.DoGC(gcTs)
-	return nil
 }
 
 func (p *processor) Close() error {
@@ -795,7 +775,10 @@ func (p *processor) Close() error {
 	syncTableNumGauge.DeleteLabelValues(p.changefeedID, p.captureInfo.AdvertiseAddr)
 	processorErrorCounter.DeleteLabelValues(p.changefeedID, p.captureInfo.AdvertiseAddr)
 	if p.sinkManager != nil {
-		return p.sinkManager.Close()
+		// pass a canceled context is ok here, since we don't need to wait Close
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return p.sinkManager.Close(ctx)
 	}
 	return nil
 }
