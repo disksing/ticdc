@@ -15,666 +15,863 @@ package processor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
+	"os"
+	"sync/atomic"
 	"testing"
 
-	"github.com/pingcap/check"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
-	tablepipeline "github.com/pingcap/ticdc/cdc/processor/pipeline"
-	cdcContext "github.com/pingcap/ticdc/pkg/context"
-	cerror "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/orchestrator"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tiflow/cdc/async"
+	"github.com/pingcap/tiflow/cdc/entry"
+	"github.com/pingcap/tiflow/cdc/entry/schema"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/processor/sinkmanager"
+	"github.com/pingcap/tiflow/cdc/processor/sourcemanager"
+	"github.com/pingcap/tiflow/cdc/processor/tablepb"
+	"github.com/pingcap/tiflow/cdc/redo"
+	"github.com/pingcap/tiflow/cdc/scheduler"
+	"github.com/pingcap/tiflow/cdc/scheduler/schedulepb"
+	"github.com/pingcap/tiflow/cdc/vars"
+	"github.com/pingcap/tiflow/pkg/config"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/etcd"
+	"github.com/pingcap/tiflow/pkg/orchestrator"
+	redoPkg "github.com/pingcap/tiflow/pkg/redo"
+	"github.com/pingcap/tiflow/pkg/spanz"
+	"github.com/pingcap/tiflow/pkg/upstream"
+	"github.com/pingcap/tiflow/pkg/util"
+	"github.com/stretchr/testify/require"
 )
 
-func Test(t *testing.T) { check.TestingT(t) }
+func newProcessor4Test(
+	t *testing.T,
+	info *model.ChangeFeedInfo,
+	status *model.ChangeFeedStatus,
+	captureInfo *model.CaptureInfo,
+	liveness *model.Liveness,
+	cfg *config.SchedulerConfig,
+	enableRedo bool,
+	client etcd.OwnerCaptureInfoClient,
+	globalVars *vars.GlobalVars,
+) *processor {
+	changefeedID := model.ChangeFeedID4Test("processor-test", "processor-test")
+	up := upstream.NewUpstream4Test(&sinkmanager.MockPD{})
+	p := NewProcessor(
+		info,
+		status,
+		captureInfo,
+		changefeedID, up, liveness, 0, cfg, client, globalVars)
+	// Some cases want to send errors to the processor without initializing it.
+	p.sinkManager.errors = make(chan error, 16)
+	p.lazyInit = func(ctx context.Context) error {
+		if p.initialized.Load() {
+			return nil
+		}
 
-type processorSuite struct{}
+		if !enableRedo {
+			p.redo.r = redo.NewDisabledDMLManager()
+		} else {
+			tmpDir := t.TempDir()
+			redoDir := fmt.Sprintf("%s/%s", tmpDir, changefeedID)
+			dmlMgr := redo.NewDMLManager(changefeedID, &config.ConsistentConfig{
+				Level:                 string(redoPkg.ConsistentLevelEventual),
+				MaxLogSize:            redoPkg.DefaultMaxLogSize,
+				FlushIntervalInMs:     redoPkg.DefaultFlushIntervalInMs,
+				MetaFlushIntervalInMs: redoPkg.DefaultMetaFlushIntervalInMs,
+				EncodingWorkerNum:     redoPkg.DefaultEncodingWorkerNum,
+				FlushWorkerNum:        redoPkg.DefaultFlushWorkerNum,
+				Storage:               "file://" + redoDir,
+				UseFileBackend:        false,
+			})
+			p.redo.r = dmlMgr
+		}
+		p.redo.name = "RedoManager"
+		p.redo.changefeedID = changefeedID
+		p.redo.spawn(ctx)
 
-var _ = check.Suite(&processorSuite{})
+		p.agent = &mockAgent{executor: p, liveness: liveness}
+		p.sinkManager.r, p.sourceManager.r, _ = sinkmanager.NewManagerWithMemEngine(
+			t, changefeedID, info, p.redo.r)
+		p.sinkManager.name = "SinkManager"
+		p.sinkManager.changefeedID = changefeedID
+		p.sinkManager.spawn(ctx)
+		p.sourceManager.name = "SourceManager"
+		p.sourceManager.changefeedID = changefeedID
+		p.sourceManager.spawn(ctx)
 
-func initProcessor4Test(ctx cdcContext.Context, c *check.C) (*processor, *orchestrator.ReactorStateTester) {
-	p := newProcessor4Test(ctx, func(ctx cdcContext.Context, tableID model.TableID, replicaInfo *model.TableReplicaInfo) (tablepipeline.TablePipeline, error) {
-		return &mockTablePipeline{
-			tableID:      tableID,
-			name:         fmt.Sprintf("`test`.`table%d`", tableID),
-			status:       tablepipeline.TableStatusRunning,
-			resolvedTs:   replicaInfo.StartTs,
-			checkpointTs: replicaInfo.StartTs,
-		}, nil
-	})
-	p.changefeed = model.NewChangefeedReactorState(ctx.ChangefeedVars().ID)
-	return p, orchestrator.NewReactorStateTester(c, p.changefeed, map[string]string{
-		"/tidb/cdc/capture/" + ctx.GlobalVars().CaptureInfo.ID:                                     `{"id":"` + ctx.GlobalVars().CaptureInfo.ID + `","address":"127.0.0.1:8300"}`,
-		"/tidb/cdc/changefeed/info/" + ctx.ChangefeedVars().ID:                                     `{"sink-uri":"blackhole://","opts":{},"create-time":"2020-02-02T00:00:00.000000+00:00","start-ts":0,"target-ts":0,"admin-job-type":0,"sort-engine":"memory","sort-dir":".","config":{"case-sensitive":true,"enable-old-value":false,"force-replicate":false,"check-gc-safe-point":true,"filter":{"rules":["*.*"],"ignore-txn-start-ts":null,"ddl-allow-list":null},"mounter":{"worker-num":16},"sink":{"dispatchers":null,"protocol":"default"},"cyclic-replication":{"enable":false,"replica-id":0,"filter-replica-ids":null,"id-buckets":0,"sync-ddl":false},"scheduler":{"type":"table-number","polling-time":-1}},"state":"normal","history":null,"error":null,"sync-point-enabled":false,"sync-point-interval":600000000000}`,
-		"/tidb/cdc/job/" + ctx.ChangefeedVars().ID:                                                 `{"resolved-ts":0,"checkpoint-ts":0,"admin-job-type":0}`,
-		"/tidb/cdc/task/status/" + ctx.GlobalVars().CaptureInfo.ID + "/" + ctx.ChangefeedVars().ID: `{"tables":{},"operation":null,"admin-job-type":0}`,
-	})
-}
+		// NOTICE: we have to bind the sourceManager to the sinkManager
+		// otherwise the sinkManager will not receive the resolvedTs.
+		p.sourceManager.r.OnResolve(p.sinkManager.r.UpdateReceivedSorterResolvedTs)
 
-type mockTablePipeline struct {
-	tableID      model.TableID
-	name         string
-	resolvedTs   model.Ts
-	checkpointTs model.Ts
-	barrierTs    model.Ts
-	stopTs       model.Ts
-	status       tablepipeline.TableStatus
-	canceled     bool
-}
-
-func (m *mockTablePipeline) ID() (tableID int64, markTableID int64) {
-	return m.tableID, 0
-}
-
-func (m *mockTablePipeline) Name() string {
-	return m.name
-}
-
-func (m *mockTablePipeline) ResolvedTs() model.Ts {
-	return m.resolvedTs
-}
-
-func (m *mockTablePipeline) CheckpointTs() model.Ts {
-	return m.checkpointTs
-}
-
-func (m *mockTablePipeline) UpdateBarrierTs(ts model.Ts) {
-	m.barrierTs = ts
-}
-
-func (m *mockTablePipeline) AsyncStop(targetTs model.Ts) bool {
-	m.stopTs = targetTs
-	return true
-}
-
-func (m *mockTablePipeline) Workload() model.WorkloadInfo {
-	return model.WorkloadInfo{Workload: 1}
-}
-
-func (m *mockTablePipeline) Status() tablepipeline.TableStatus {
-	return m.status
-}
-
-func (m *mockTablePipeline) Cancel() {
-	if m.canceled {
-		log.Panic("cancel a canceled table pipeline")
+		p.initialized.Store(true)
+		return nil
 	}
-	m.canceled = true
+	p.initializer = async.NewInitializer()
+
+	p.ddlHandler.r = &ddlHandler{
+		schemaStorage: &mockSchemaStorage{t: t, resolvedTs: math.MaxUint64},
+	}
+	return p
 }
 
-func (m *mockTablePipeline) Wait() {
-	// do nothing
+// nolint
+func initProcessor4Test(t *testing.T, liveness *model.Liveness, enableRedo bool,
+	globalVars *vars.GlobalVars, changefeedVars *model.ChangeFeedInfo,
+) (*processor, *orchestrator.ReactorStateTester, *orchestrator.ChangefeedReactorState) {
+	changefeedInfo := `
+{
+    "sink-uri": "blackhole://",
+    "create-time": "2020-02-02T00:00:00.000000+00:00",
+    "start-ts": 0,
+    "target-ts": 0,
+    "admin-job-type": 0,
+    "sort-engine": "memory",
+    "sort-dir": ".",
+    "config": {
+        "case-sensitive": true,
+        "force-replicate": false,
+        "check-gc-safe-point": true,
+        "filter": {
+            "rules": [
+                "*.*"
+            ],
+            "ignore-txn-start-ts": null
+        },
+        "mounter": {
+            "worker-num": 16
+        },
+        "sink": {
+            "dispatchers": null,
+            "protocol": "open-protocol",
+            "advance-timeout-in-sec": 150
+        }
+    },
+    "state": "normal",
+    "history": null,
+    "error": null,
+    "sync-point-enabled": false,
+    "sync-point-interval": 600000000000
+}
+`
+	changefeed := orchestrator.NewChangefeedReactorState(
+		etcd.DefaultCDCClusterID, model.DefaultChangeFeedID(changefeedVars.ID))
+	captureInfo := &model.CaptureInfo{ID: "capture-test", AdvertiseAddr: "127.0.0.1:0000"}
+	cfg := config.NewDefaultSchedulerConfig()
+
+	captureID := globalVars.CaptureInfo.ID
+	changefeedID := changefeedVars.ID
+	tester := orchestrator.NewReactorStateTester(t, changefeed, map[string]string{
+		fmt.Sprintf("%s/capture/%s",
+			etcd.DefaultClusterAndMetaPrefix,
+			captureID): `{"id":"` + captureID + `","address":"127.0.0.1:8300"}`,
+		fmt.Sprintf("%s/changefeed/info/%s",
+			etcd.DefaultClusterAndNamespacePrefix,
+			changefeedID): changefeedInfo,
+		fmt.Sprintf("%s/changefeed/status/%s",
+			etcd.DefaultClusterAndNamespacePrefix,
+			changefeedVars.ID): `{"resolved-ts":0,"checkpoint-ts":0,"admin-job-type":0}`,
+	})
+	p := newProcessor4Test(t, changefeed.Info, changefeed.Status, captureInfo, liveness, cfg, enableRedo, nil, globalVars)
+
+	return p, tester, changefeed
 }
 
-func (s *processorSuite) TestCheckTablesNum(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	var err error
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals,
-		&model.TaskPosition{
-			CheckPointTs: 0,
-			ResolvedTs:   0,
-			Count:        0,
-			Error:        nil,
-		})
+type mockSchemaStorage struct {
+	// dummy to provide default versions of unimplemented interface methods,
+	// as we only need ResolvedTs() and DoGC() in unit tests.
+	entry.SchemaStorage
 
-	p, tester = initProcessor4Test(ctx, c)
-	p.changefeed.Info.StartTs = 66
-	p.changefeed.Status.CheckpointTs = 88
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals,
-		&model.TaskPosition{
-			CheckPointTs: 88,
-			ResolvedTs:   88,
-			Count:        0,
-			Error:        nil,
-		})
+	t          *testing.T
+	lastGcTs   uint64
+	resolvedTs uint64
 }
 
-func (s *processorSuite) TestHandleTableOperation4SingleTable(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	var err error
+func (s *mockSchemaStorage) ResolvedTs() uint64 {
+	return s.resolvedTs
+}
+
+func (s *mockSchemaStorage) DoGC(ts uint64) uint64 {
+	require.LessOrEqual(s.t, s.lastGcTs, ts)
+	atomic.StoreUint64(&s.lastGcTs, ts)
+	return ts
+}
+
+func (s *mockSchemaStorage) GetLastSnapshot() *schema.Snapshot {
+	return schema.NewEmptySnapshot(false)
+}
+
+type mockAgent struct {
+	// dummy to satisfy the interface
+	scheduler.Agent
+
+	executor scheduler.TableExecutor
+	liveness *model.Liveness
+	isClosed bool
+}
+
+func (a *mockAgent) Tick(_ context.Context) (*schedulepb.Barrier, error) {
+	return nil, nil
+}
+
+func (a *mockAgent) Close() error {
+	a.isClosed = true
+	return nil
+}
+
+func TestTableExecutorAddingTableIndirectly(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
+
 	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(ctx))
+	createTaskPosition(changefeed, p.captureInfo)
 	tester.MustApplyPatches()
-	p.changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
-		status.CheckpointTs = 90
-		status.ResolvedTs = 100
-		return status, true, nil
-	})
-	p.changefeed.PatchTaskPosition(p.captureInfo.ID, func(position *model.TaskPosition) (*model.TaskPosition, bool, error) {
-		position.ResolvedTs = 100
-		return position, true, nil
-	})
-	tester.MustApplyPatches()
-
-	// no operation
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-
-	// add table, in processing
-	// in current implementation of owner, the startTs and BoundaryTs of add table operation should be always equaled.
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.AddTable(66, &model.TableReplicaInfo{StartTs: 60}, 60)
-		return status, true, nil
-	})
-	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{
-			66: {StartTs: 60},
-		},
-		Operation: map[int64]*model.TableOperation{
-			66: {Delete: false, BoundaryTs: 60, Done: false, Status: model.OperProcessed},
-		},
-	})
-
-	// add table, not finished
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{
-			66: {StartTs: 60},
-		},
-		Operation: map[int64]*model.TableOperation{
-			66: {Delete: false, BoundaryTs: 60, Done: false, Status: model.OperProcessed},
-		},
-	})
-
-	// add table, push the resolvedTs
-	table66 := p.tables[66].(*mockTablePipeline)
-	table66.resolvedTs = 101
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{
-			66: {StartTs: 60},
-		},
-		Operation: map[int64]*model.TableOperation{
-			66: {Delete: false, BoundaryTs: 60, Done: false, Status: model.OperProcessed},
-		},
-	})
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID].ResolvedTs, check.Equals, uint64(101))
-
-	// finish the operation
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{
-			66: {StartTs: 60},
-		},
-		Operation: map[int64]*model.TableOperation{
-			66: {Delete: false, BoundaryTs: 60, Done: true, Status: model.OperFinished},
-		},
-	})
-
-	// clear finished operations
-	cleanUpFinishedOpOperation(p.changefeed, p.captureInfo.ID, tester)
-
-	// remove table, in processing
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.RemoveTable(66, 120, false)
-		return status, true, nil
-	})
-	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{},
-		Operation: map[int64]*model.TableOperation{
-			66: {Delete: true, BoundaryTs: 120, Done: false, Status: model.OperProcessed},
-		},
-	})
-	c.Assert(table66.stopTs, check.Equals, uint64(120))
-
-	// remove table, not finished
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{},
-		Operation: map[int64]*model.TableOperation{
-			66: {Delete: true, BoundaryTs: 120, Done: false, Status: model.OperProcessed},
-		},
-	})
-
-	// remove table, finished
-	table66.status = tablepipeline.TableStatusStopped
-	table66.checkpointTs = 121
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{},
-		Operation: map[int64]*model.TableOperation{
-			66: {Delete: true, BoundaryTs: 121, Done: true, Status: model.OperFinished},
-		},
-	})
-	c.Assert(table66.canceled, check.IsTrue)
-	c.Assert(p.tables[66], check.IsNil)
-}
-
-func (s *processorSuite) TestHandleTableOperation4MultiTable(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	var err error
-	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	p.changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
+	changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
 		status.CheckpointTs = 20
-		status.ResolvedTs = 20
 		return status, true, nil
-	})
-	p.changefeed.PatchTaskPosition(p.captureInfo.ID, func(position *model.TaskPosition) (*model.TaskPosition, bool, error) {
-		position.ResolvedTs = 100
-		position.CheckPointTs = 90
-		return position, true, nil
 	})
 	tester.MustApplyPatches()
 
 	// no operation
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
 
-	// add table, in processing
-	// in current implementation of owner, the startTs and BoundaryTs of add table operation should be always equaled.
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.AddTable(1, &model.TableReplicaInfo{StartTs: 60}, 60)
-		status.AddTable(2, &model.TableReplicaInfo{StartTs: 50}, 50)
-		status.AddTable(3, &model.TableReplicaInfo{StartTs: 40}, 40)
-		status.Tables[4] = &model.TableReplicaInfo{StartTs: 30}
-		return status, true, nil
-	})
-	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{
-			1: {StartTs: 60},
-			2: {StartTs: 50},
-			3: {StartTs: 40},
-			4: {StartTs: 30},
-		},
-		Operation: map[int64]*model.TableOperation{
-			1: {Delete: false, BoundaryTs: 60, Done: false, Status: model.OperProcessed},
-			2: {Delete: false, BoundaryTs: 50, Done: false, Status: model.OperProcessed},
-			3: {Delete: false, BoundaryTs: 40, Done: false, Status: model.OperProcessed},
-		},
-	})
-	c.Assert(p.tables, check.HasLen, 4)
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID].CheckPointTs, check.Equals, uint64(30))
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID].ResolvedTs, check.Equals, uint64(30))
+	// table-1: `preparing` -> `prepared` -> `replicating`
+	span := spanz.TableIDToComparableSpan(1)
+	ok, err := p.AddTableSpan(ctx, span, tablepb.Checkpoint{CheckpointTs: 20}, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	p.sinkManager.r.UpdateBarrierTs(20, nil)
+	stats := p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, model.Ts(20), stats.CheckpointTs)
+	require.Equal(t, model.Ts(20), stats.ResolvedTs)
+	require.Equal(t, model.Ts(20), stats.BarrierTs)
+	require.Len(t, p.sinkManager.r.GetAllCurrentTableSpans(), 1)
+	require.Equal(t, 1, p.sinkManager.r.GetAllCurrentTableSpansCount())
 
-	// add table, push the resolvedTs, finished add table
-	table1 := p.tables[1].(*mockTablePipeline)
-	table2 := p.tables[2].(*mockTablePipeline)
-	table3 := p.tables[3].(*mockTablePipeline)
-	table4 := p.tables[4].(*mockTablePipeline)
-	table1.resolvedTs = 101
-	table2.resolvedTs = 101
-	table3.resolvedTs = 102
-	table4.resolvedTs = 103
-	// removed table 3
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.RemoveTable(3, 60, false)
-		return status, true, nil
-	})
-	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{
-			1: {StartTs: 60},
-			2: {StartTs: 50},
-			4: {StartTs: 30},
-		},
-		Operation: map[int64]*model.TableOperation{
-			1: {Delete: false, BoundaryTs: 60, Done: true, Status: model.OperFinished},
-			2: {Delete: false, BoundaryTs: 50, Done: true, Status: model.OperFinished},
-			3: {Delete: true, BoundaryTs: 60, Done: false, Status: model.OperProcessed},
-		},
-	})
-	c.Assert(p.tables, check.HasLen, 4)
-	c.Assert(table3.canceled, check.IsFalse)
-	c.Assert(table3.stopTs, check.Equals, uint64(60))
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID].ResolvedTs, check.Equals, uint64(101))
+	done := p.IsAddTableSpanFinished(spanz.TableIDToComparableSpan(1), true)
+	require.False(t, done)
+	state, ok := p.sinkManager.r.GetTableState(span)
+	require.True(t, ok)
+	require.Equal(t, tablepb.TableStatePreparing, state)
 
-	// finish remove operations
-	table3.status = tablepipeline.TableStatusStopped
-	table3.checkpointTs = 65
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{
-			1: {StartTs: 60},
-			2: {StartTs: 50},
-			4: {StartTs: 30},
-		},
-		Operation: map[int64]*model.TableOperation{
-			1: {Delete: false, BoundaryTs: 60, Done: true, Status: model.OperFinished},
-			2: {Delete: false, BoundaryTs: 50, Done: true, Status: model.OperFinished},
-			3: {Delete: true, BoundaryTs: 65, Done: true, Status: model.OperFinished},
-		},
-	})
-	c.Assert(p.tables, check.HasLen, 3)
-	c.Assert(table3.canceled, check.IsTrue)
+	// Push the resolved ts, mock that sorterNode receive first resolved event.
+	p.sourceManager.r.Add(
+		span,
+		[]*model.PolymorphicEvent{{
+			CRTs: 101,
+			RawKV: &model.RawKVEntry{
+				OpType: model.OpTypeResolved,
+				CRTs:   101,
+			},
+		}}...,
+	)
 
-	// clear finished operations
-	cleanUpFinishedOpOperation(p.changefeed, p.captureInfo.ID, tester)
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
 
-	// remove table, in processing
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.RemoveTable(1, 120, false)
-		status.RemoveTable(4, 120, false)
-		delete(status.Tables, 2)
-		return status, true, nil
-	})
-	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{},
-		Operation: map[int64]*model.TableOperation{
-			1: {Delete: true, BoundaryTs: 120, Done: false, Status: model.OperProcessed},
-			4: {Delete: true, BoundaryTs: 120, Done: false, Status: model.OperProcessed},
-		},
-	})
-	c.Assert(table1.stopTs, check.Equals, uint64(120))
-	c.Assert(table4.stopTs, check.Equals, uint64(120))
-	c.Assert(table2.canceled, check.IsTrue)
-	c.Assert(p.tables, check.HasLen, 2)
+	done = p.IsAddTableSpanFinished(span, true)
+	require.True(t, done)
+	state, ok = p.sinkManager.r.GetTableState(span)
+	require.True(t, ok)
+	require.Equal(t, tablepb.TableStatePrepared, state)
 
-	// remove table, not finished
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{},
-		Operation: map[int64]*model.TableOperation{
-			1: {Delete: true, BoundaryTs: 120, Done: false, Status: model.OperProcessed},
-			4: {Delete: true, BoundaryTs: 120, Done: false, Status: model.OperProcessed},
-		},
-	})
+	ok, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(1), tablepb.Checkpoint{CheckpointTs: 30}, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	stats = p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, model.Ts(20), stats.CheckpointTs)
+	require.Equal(t, model.Ts(101), stats.ResolvedTs)
+	require.Equal(t, model.Ts(20), stats.BarrierTs)
 
-	// remove table, finished
-	table1.status = tablepipeline.TableStatusStopped
-	table1.checkpointTs = 121
-	table4.status = tablepipeline.TableStatusStopped
-	table4.checkpointTs = 122
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	// Start to replicate table-1.
+	ok, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(1), tablepb.Checkpoint{CheckpointTs: 30}, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{},
-		Operation: map[int64]*model.TableOperation{
-			1: {Delete: true, BoundaryTs: 121, Done: true, Status: model.OperFinished},
-			4: {Delete: true, BoundaryTs: 122, Done: true, Status: model.OperFinished},
-		},
-	})
-	c.Assert(table1.canceled, check.IsTrue)
-	c.Assert(table4.canceled, check.IsTrue)
-	c.Assert(p.tables, check.HasLen, 0)
+
+	// table-1: `prepared` -> `replicating`
+	state, ok = p.sinkManager.r.GetTableState(span)
+	require.True(t, ok)
+	require.Equal(t, tablepb.TableStateReplicating, state)
+
+	err = p.Close()
+	require.Nil(t, err)
+	require.Nil(t, p.agent)
 }
 
-func (s *processorSuite) TestInitTable(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	var err error
-	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
+func TestTableExecutorAddingTableIndirectlyWithRedoEnabled(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, true, globalVars, changefeedVars)
 
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.Tables[1] = &model.TableReplicaInfo{StartTs: 20}
-		status.Tables[2] = &model.TableReplicaInfo{StartTs: 30}
+	// init tick
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(ctx))
+	createTaskPosition(changefeed, p.captureInfo)
+	tester.MustApplyPatches()
+	changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
+		status.CheckpointTs = 20
 		return status, true, nil
 	})
 	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+
+	// no operation
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
-	c.Assert(p.tables[1], check.Not(check.IsNil))
-	c.Assert(p.tables[2], check.Not(check.IsNil))
+
+	// table-1: `preparing` -> `prepared` -> `replicating`
+	span := spanz.TableIDToComparableSpan(1)
+	ok, err := p.AddTableSpan(ctx, span, tablepb.Checkpoint{CheckpointTs: 20}, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	p.sinkManager.r.UpdateBarrierTs(20, nil)
+	stats := p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, model.Ts(20), stats.CheckpointTs)
+	require.Equal(t, model.Ts(20), stats.ResolvedTs)
+	require.Equal(t, model.Ts(20), stats.BarrierTs)
+	require.Len(t, p.sinkManager.r.GetAllCurrentTableSpans(), 1)
+	require.Equal(t, 1, p.sinkManager.r.GetAllCurrentTableSpansCount())
+
+	done := p.IsAddTableSpanFinished(spanz.TableIDToComparableSpan(1), true)
+	require.False(t, done)
+	state, ok := p.sinkManager.r.GetTableState(span)
+	require.True(t, ok)
+	require.Equal(t, tablepb.TableStatePreparing, state)
+
+	// Push the resolved ts, mock that sorterNode receive first resolved event.
+	p.sourceManager.r.Add(
+		span,
+		[]*model.PolymorphicEvent{{
+			CRTs: 101,
+			RawKV: &model.RawKVEntry{
+				OpType: model.OpTypeResolved,
+				CRTs:   101,
+			},
+		}}...,
+	)
+
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+
+	done = p.IsAddTableSpanFinished(span, true)
+	require.True(t, done)
+	state, ok = p.sinkManager.r.GetTableState(span)
+	require.True(t, ok)
+	require.Equal(t, tablepb.TableStatePrepared, state)
+
+	// ignore duplicate add request
+	ok, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(1), tablepb.Checkpoint{CheckpointTs: 30}, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	stats = p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, model.Ts(20), stats.CheckpointTs)
+	require.Equal(t, model.Ts(20), stats.ResolvedTs)
+	require.Equal(t, model.Ts(20), stats.BarrierTs)
+
+	p.sinkManager.r.UpdateBarrierTs(50, nil)
+	stats = p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, model.Ts(20), stats.ResolvedTs)
+	require.Equal(t, model.Ts(50), stats.BarrierTs)
+
+	// Start to replicate table-1.
+	ok, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(1), tablepb.Checkpoint{CheckpointTs: 30, ResolvedTs: 60}, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	stats = p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, model.Ts(60), stats.ResolvedTs)
+	require.Equal(t, model.Ts(50), stats.BarrierTs)
+
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+
+	// table-1: `prepared` -> `replicating`
+	state, ok = p.sinkManager.r.GetTableState(span)
+	require.True(t, ok)
+	require.Equal(t, tablepb.TableStateReplicating, state)
+
+	err = p.Close()
+	require.Nil(t, err)
+	require.Nil(t, p.agent)
 }
 
-func (s *processorSuite) TestProcessorError(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	var err error
+func TestProcessorError(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
+
 	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, p.lazyInit(ctx))
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	createTaskPosition(changefeed, p.captureInfo)
 	tester.MustApplyPatches()
 
 	// send a abnormal error
-	p.sendError(cerror.ErrSinkURIInvalid)
-	_, err = p.Tick(ctx, p.changefeed)
+	p.sinkManager.errors <- cerror.ErrSinkURIInvalid
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Error(t, err)
+	patchProcessorErr(p.captureInfo, changefeed, err)
 	tester.MustApplyPatches()
-	c.Assert(cerror.ErrReactorFinished.Equal(errors.Cause(err)), check.IsTrue)
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals, &model.TaskPosition{
+	require.Equal(t, changefeed.TaskPositions[p.captureInfo.ID], &model.TaskPosition{
 		Error: &model.RunningError{
+			Time:    changefeed.TaskPositions[p.captureInfo.ID].Error.Time,
 			Addr:    "127.0.0.1:0000",
 			Code:    "CDC:ErrSinkURIInvalid",
-			Message: "[CDC:ErrSinkURIInvalid]sink uri invalid",
+			Message: "[CDC:ErrSinkURIInvalid]sink uri invalid '%s'",
 		},
 	})
+	require.Nil(t, p.Close())
+	tester.MustApplyPatches()
 
-	p, tester = initProcessor4Test(ctx, c)
+	p, tester, changefeed = initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
 	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, p.lazyInit(ctx))
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	createTaskPosition(changefeed, p.captureInfo)
 	tester.MustApplyPatches()
 
 	// send a normal error
-	p.sendError(context.Canceled)
-	_, err = p.Tick(ctx, p.changefeed)
+	p.sinkManager.errors <- context.Canceled
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	patchProcessorErr(p.captureInfo, changefeed, err)
 	tester.MustApplyPatches()
-	c.Assert(cerror.ErrReactorFinished.Equal(errors.Cause(err)), check.IsTrue)
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals, &model.TaskPosition{
+	require.True(t, cerror.ErrReactorFinished.Equal(errors.Cause(err)))
+	require.Equal(t, changefeed.TaskPositions[p.captureInfo.ID], &model.TaskPosition{
 		Error: nil,
 	})
+	require.Nil(t, p.Close())
+	tester.MustApplyPatches()
 }
 
-func (s *processorSuite) TestProcessorExit(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	var err error
+func TestProcessorExit(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
 	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(context.Background()))
+	createTaskPosition(changefeed, p.captureInfo)
 	tester.MustApplyPatches()
 
 	// stop the changefeed
-	p.changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
-		status.AdminJobType = model.AdminStop
-		return status, true, nil
-	})
-	p.changefeed.PatchTaskStatus(ctx.GlobalVars().CaptureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
+	changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
 		status.AdminJobType = model.AdminStop
 		return status, true, nil
 	})
 	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(cerror.ErrReactorFinished.Equal(errors.Cause(err)), check.IsTrue)
+	require.False(t, checkChangefeedNormal(changefeed))
 	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals, &model.TaskPosition{
+	require.Equal(t, changefeed.TaskPositions[p.captureInfo.ID], &model.TaskPosition{
 		Error: nil,
 	})
+	require.Nil(t, p.Close())
+	tester.MustApplyPatches()
 }
 
-func (s *processorSuite) TestProcessorClose(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	var err error
+func TestProcessorClose(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
 	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(ctx))
+	createTaskPosition(changefeed, p.captureInfo)
+	tester.MustApplyPatches()
+
+	// Do a no operation tick to lazy init the processor.
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
 
 	// add tables
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.Tables[1] = &model.TableReplicaInfo{StartTs: 20}
-		status.Tables[2] = &model.TableReplicaInfo{StartTs: 30}
-		return status, true, nil
-	})
-	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	done, err := p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(1), tablepb.Checkpoint{CheckpointTs: 20}, false)
+	require.Nil(t, err)
+	require.True(t, done)
+	done, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(2), tablepb.Checkpoint{CheckpointTs: 30}, false)
+	require.Nil(t, err)
+	require.True(t, done)
+
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
 
 	// push the resolvedTs and checkpointTs
-	p.changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
-		status.ResolvedTs = 100
+	changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
 		return status, true, nil
 	})
 	tester.MustApplyPatches()
-	p.tables[1].(*mockTablePipeline).resolvedTs = 110
-	p.tables[2].(*mockTablePipeline).resolvedTs = 90
-	p.tables[1].(*mockTablePipeline).checkpointTs = 90
-	p.tables[2].(*mockTablePipeline).checkpointTs = 95
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals, &model.TaskPosition{
-		CheckPointTs: 90,
-		ResolvedTs:   90,
-		Error:        nil,
-	})
-	c.Assert(p.changefeed.TaskStatuses[p.captureInfo.ID], check.DeepEquals, &model.TaskStatus{
-		Tables: map[int64]*model.TableReplicaInfo{1: {StartTs: 20}, 2: {StartTs: 30}},
-	})
-	c.Assert(p.changefeed.Workloads[p.captureInfo.ID], check.DeepEquals, model.TaskWorkload{1: {Workload: 1}, 2: {Workload: 1}})
+	require.Contains(t, changefeed.TaskPositions, p.captureInfo.ID)
 
-	c.Assert(p.Close(), check.IsNil)
+	require.Nil(t, p.Close())
 	tester.MustApplyPatches()
-	c.Assert(p.tables[1].(*mockTablePipeline).canceled, check.IsTrue)
-	c.Assert(p.tables[2].(*mockTablePipeline).canceled, check.IsTrue)
+	require.Nil(t, p.sinkManager.r)
+	require.Nil(t, p.sourceManager.r)
+	require.Nil(t, p.agent)
 
-	p, tester = initProcessor4Test(ctx, c)
+	p, tester, changefeed = initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
 	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(ctx))
+	createTaskPosition(changefeed, p.captureInfo)
+	tester.MustApplyPatches()
+
+	// Do a no operation tick to lazy init the processor.
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
 
 	// add tables
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.Tables[1] = &model.TableReplicaInfo{StartTs: 20}
-		status.Tables[2] = &model.TableReplicaInfo{StartTs: 30}
-		return status, true, nil
-	})
-	tester.MustApplyPatches()
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	done, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(1), tablepb.Checkpoint{CheckpointTs: 20}, false)
+	require.Nil(t, err)
+	require.True(t, done)
+	done, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(2), tablepb.Checkpoint{CheckpointTs: 30}, false)
+	require.Nil(t, err)
+	require.True(t, done)
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
 
 	// send error
-	p.sendError(cerror.ErrSinkURIInvalid)
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(cerror.ErrReactorFinished.Equal(errors.Cause(err)), check.IsTrue)
+	p.sinkManager.errors <- cerror.ErrSinkURIInvalid
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Error(t, err)
+	patchProcessorErr(p.captureInfo, changefeed, err)
 	tester.MustApplyPatches()
 
-	c.Assert(p.Close(), check.IsNil)
+	require.Nil(t, p.Close())
 	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID].Error, check.DeepEquals, &model.RunningError{
+	require.Equal(t, changefeed.TaskPositions[p.captureInfo.ID].Error, &model.RunningError{
+		Time:    changefeed.TaskPositions[p.captureInfo.ID].Error.Time,
 		Addr:    "127.0.0.1:0000",
 		Code:    "CDC:ErrSinkURIInvalid",
-		Message: "[CDC:ErrSinkURIInvalid]sink uri invalid",
+		Message: "[CDC:ErrSinkURIInvalid]sink uri invalid '%s'",
 	})
-	c.Assert(p.tables[1].(*mockTablePipeline).canceled, check.IsTrue)
-	c.Assert(p.tables[2].(*mockTablePipeline).canceled, check.IsTrue)
+	require.Nil(t, p.sinkManager.r)
+	require.Nil(t, p.sourceManager.r)
+	require.Nil(t, p.agent)
 }
 
-func (s *processorSuite) TestPositionDeleted(c *check.C) {
-	defer testleak.AfterTest(c)()
-	ctx := cdcContext.NewBackendContext4Test(true)
-	p, tester := initProcessor4Test(ctx, c)
-	p.changefeed.PatchTaskStatus(p.captureInfo.ID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		status.Tables[1] = &model.TableReplicaInfo{StartTs: 30}
-		status.Tables[2] = &model.TableReplicaInfo{StartTs: 40}
-		return status, true, nil
-	})
+func TestPositionDeleted(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
+	// init tick
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(ctx))
+	createTaskPosition(changefeed, p.captureInfo)
+	tester.MustApplyPatches()
+	require.Contains(t, changefeed.TaskPositions, p.captureInfo.ID)
+
+	// Do a no operation tick to lazy init the processor.
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+
+	// add table
+	done, err := p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(1), tablepb.Checkpoint{CheckpointTs: 30}, false)
+	require.Nil(t, err)
+	require.True(t, done)
+	done, err = p.AddTableSpan(ctx, spanz.TableIDToComparableSpan(2), tablepb.Checkpoint{CheckpointTs: 40}, false)
+	require.Nil(t, err)
+	require.True(t, done)
+
+	// some others delete the task position
+	changefeed.PatchTaskPosition(p.captureInfo.ID,
+		func(position *model.TaskPosition) (*model.TaskPosition, bool, error) {
+			return nil, true, nil
+		})
+	tester.MustApplyPatches()
+
+	// position created again
+	checkChangefeedNormal(changefeed)
+	createTaskPosition(changefeed, p.captureInfo)
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+	require.Equal(t, &model.TaskPosition{}, changefeed.TaskPositions[p.captureInfo.ID])
+	require.Contains(t, changefeed.TaskPositions, p.captureInfo.ID)
+
+	require.Nil(t, p.Close())
+	tester.MustApplyPatches()
+}
+
+func TestSchemaGC(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
+
 	var err error
 	// init tick
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(ctx))
+	createTaskPosition(changefeed, p.captureInfo)
 	tester.MustApplyPatches()
 
-	// cal position
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	updateChangeFeedPosition(t, tester,
+		model.DefaultChangeFeedID("changefeed-id-test"),
+		50)
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
 	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals, &model.TaskPosition{
-		CheckPointTs: 30,
-		ResolvedTs:   30,
-	})
 
-	// some other delete the task position
-	p.changefeed.PatchTaskPosition(p.captureInfo.ID, func(position *model.TaskPosition) (*model.TaskPosition, bool, error) {
-		return nil, true, nil
-	})
-	tester.MustApplyPatches()
-	// position created again
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
-	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals, &model.TaskPosition{
-		CheckPointTs: 0,
-		ResolvedTs:   0,
-	})
+	// GC Ts should be (checkpoint - 1).
+	require.Equal(t, p.ddlHandler.r.schemaStorage.(*mockSchemaStorage).lastGcTs, uint64(49))
+	require.Equal(t, p.lastSchemaTs, uint64(49))
 
-	// cal position
-	_, err = p.Tick(ctx, p.changefeed)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, p.Close())
 	tester.MustApplyPatches()
-	c.Assert(p.changefeed.TaskPositions[p.captureInfo.ID], check.DeepEquals, &model.TaskPosition{
-		CheckPointTs: 30,
-		ResolvedTs:   30,
-	})
 }
 
-func cleanUpFinishedOpOperation(state *model.ChangefeedReactorState, captureID model.CaptureID, tester *orchestrator.ReactorStateTester) {
-	state.PatchTaskStatus(captureID, func(status *model.TaskStatus) (*model.TaskStatus, bool, error) {
-		if status == nil || status.Operation == nil {
-			return status, false, nil
-		}
-		for tableID, opt := range status.Operation {
-			if opt.Done && opt.Status == model.OperFinished {
-				delete(status.Operation, tableID)
-			}
-		}
+//nolint:unused
+func updateChangeFeedPosition(t *testing.T, tester *orchestrator.ReactorStateTester, cfID model.ChangeFeedID, checkpointTs model.Ts) {
+	key := etcd.CDCKey{
+		ClusterID:    etcd.DefaultCDCClusterID,
+		Tp:           etcd.CDCKeyTypeChangeFeedStatus,
+		ChangefeedID: cfID,
+	}
+	keyStr := key.String()
+
+	cfStatus := &model.ChangeFeedStatus{
+		CheckpointTs: checkpointTs,
+	}
+	valueBytes, err := json.Marshal(cfStatus)
+	require.Nil(t, err)
+
+	tester.MustUpdate(keyStr, valueBytes)
+}
+
+func TestIgnorableError(t *testing.T) {
+	testCases := []struct {
+		err       error
+		ignorable bool
+	}{
+		{nil, true},
+		{cerror.ErrAdminStopProcessor.GenWithStackByArgs(), true},
+		{cerror.ErrReactorFinished.GenWithStackByArgs(), true},
+		{cerror.ErrRedoWriterStopped.GenWithStackByArgs(), false},
+		{errors.Trace(context.Canceled), true},
+		{cerror.ErrProcessorTableNotFound.GenWithStackByArgs(), false},
+		{errors.New("test error"), false},
+	}
+	for _, tc := range testCases {
+		require.Equal(t, isProcessorIgnorableError(tc.err), tc.ignorable)
+	}
+}
+
+func TestUpdateBarrierTs(t *testing.T) {
+	globalVars, changefeedInfo := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedInfo)
+	changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
+		status.CheckpointTs = 5
 		return status, true, nil
 	})
+	p.ddlHandler.r.schemaStorage.(*mockSchemaStorage).resolvedTs = 10
+
+	// init tick
+	checkChangefeedNormal(changefeed)
+	require.Nil(t, p.lazyInit(ctx))
+	createTaskPosition(changefeed, p.captureInfo)
 	tester.MustApplyPatches()
+	require.Contains(t, changefeed.TaskPositions, p.captureInfo.ID)
+
+	// Do a no operation tick to lazy init the processor.
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+
+	span := spanz.TableIDToComparableSpan(1)
+	done, err := p.AddTableSpan(ctx, span, tablepb.Checkpoint{CheckpointTs: 5}, false)
+	require.True(t, done)
+	require.Nil(t, err)
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+
+	// Global resolved ts has advanced while schema storage stalls.
+	changefeed.PatchStatus(func(status *model.ChangeFeedStatus) (*model.ChangeFeedStatus, bool, error) {
+		return status, true, nil
+	})
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+	p.updateBarrierTs(&schedulepb.Barrier{GlobalBarrierTs: 20, TableBarriers: nil})
+	status := p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, uint64(10), status.BarrierTs)
+
+	// Schema storage has advanced too.
+	p.ddlHandler.r.schemaStorage.(*mockSchemaStorage).resolvedTs = 15
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+	p.updateBarrierTs(&schedulepb.Barrier{GlobalBarrierTs: 20, TableBarriers: nil})
+	status = p.sinkManager.r.GetTableStats(span)
+	require.Equal(t, uint64(15), status.BarrierTs)
+
+	require.Nil(t, p.Close())
+	tester.MustApplyPatches()
+}
+
+func TestProcessorLiveness(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
+
+	// First tick for creating position.
+	require.Nil(t, p.lazyInit(ctx))
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+
+	// Second tick for init.
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+
+	// Changing p.liveness affects p.agent liveness.
+	p.liveness.Store(model.LivenessCaptureStopping)
+	require.Equal(t, model.LivenessCaptureStopping, p.agent.(*mockAgent).liveness.Load())
+
+	// Changing p.agent liveness affects p.liveness.
+	// Force set liveness to alive.
+	*p.agent.(*mockAgent).liveness = model.LivenessCaptureAlive
+	require.Equal(t, model.LivenessCaptureAlive, p.liveness.Load())
+
+	require.Nil(t, p.Close())
+	tester.MustApplyPatches()
+}
+
+func TestProcessorDostNotStuckInInit(t *testing.T) {
+	_ = failpoint.
+		Enable("github.com/pingcap/tiflow/cdc/processor/sinkmanager/SinkManagerRunError",
+			"1*return(true)")
+	defer func() {
+		_ = failpoint.
+			Disable("github.com/pingcap/tiflow/cdc/processor/sinkmanager/SinkManagerRunError")
+	}()
+
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	ctx := context.Background()
+	liveness := model.LivenessCaptureAlive
+	p, tester, changefeed := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
+	require.Nil(t, p.lazyInit(ctx))
+
+	// First tick for creating position.
+	err, _ := p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+	tester.MustApplyPatches()
+
+	// Second tick for init.
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+
+	// TODO(qupeng): third tick for handle a warning.
+	err, _ = p.Tick(ctx, changefeed.Info, changefeed.Status)
+	require.Nil(t, err)
+
+	require.Nil(t, p.Close())
+	tester.MustApplyPatches()
+}
+
+func TestProcessorNotInitialized(t *testing.T) {
+	globalVars, changefeedVars := vars.NewGlobalVarsAndChangefeedInfo4Test()
+	liveness := model.LivenessCaptureAlive
+	p, _, _ := initProcessor4Test(t, &liveness, false, globalVars, changefeedVars)
+	require.Nil(t, p.WriteDebugInfo(os.Stdout))
+}
+
+func TestGetPullerSplitUpdateMode(t *testing.T) {
+	testCases := []struct {
+		sinkURI string
+		config  *config.ReplicaConfig
+		mode    sourcemanager.PullerSplitUpdateMode
+	}{
+		{
+			sinkURI: "kafka://127.0.0.1:9092/ticdc-test2",
+			config:  nil,
+			mode:    sourcemanager.PullerSplitUpdateModeNone,
+		},
+		{
+			sinkURI: "mysql://root:test@127.0.0.1:3306/",
+			config:  nil,
+			mode:    sourcemanager.PullerSplitUpdateModeAtStart,
+		},
+		{
+			sinkURI: "mysql://root:test@127.0.0.1:3306/?safe-mode=true",
+			config:  nil,
+			mode:    sourcemanager.PullerSplitUpdateModeAlways,
+		},
+		{
+			sinkURI: "mysql://root:test@127.0.0.1:3306/?safe-mode=false",
+			config:  nil,
+			mode:    sourcemanager.PullerSplitUpdateModeAtStart,
+		},
+		{
+			sinkURI: "mysql://root:test@127.0.0.1:3306/",
+			config: &config.ReplicaConfig{
+				Sink: &config.SinkConfig{
+					SafeMode: util.AddressOf(true),
+				},
+			},
+			mode: sourcemanager.PullerSplitUpdateModeAlways,
+		},
+		{
+			sinkURI: "mysql://root:test@127.0.0.1:3306/",
+			config: &config.ReplicaConfig{
+				Sink: &config.SinkConfig{
+					SafeMode: util.AddressOf(false),
+				},
+			},
+			mode: sourcemanager.PullerSplitUpdateModeAtStart,
+		},
+		{
+			sinkURI: "mysql://root:test@127.0.0.1:3306/?safe-mode=true",
+			config: &config.ReplicaConfig{
+				Sink: &config.SinkConfig{
+					SafeMode: util.AddressOf(false),
+				},
+			},
+			mode: sourcemanager.PullerSplitUpdateModeAlways,
+		},
+		{
+			sinkURI: "mysql://root:test@127.0.0.1:3306/?safe-mode=false",
+			config: &config.ReplicaConfig{
+				Sink: &config.SinkConfig{
+					SafeMode: util.AddressOf(true),
+				},
+			},
+			mode: sourcemanager.PullerSplitUpdateModeAlways,
+		},
+	}
+	for _, tc := range testCases {
+		mode, err := getPullerSplitUpdateMode(tc.sinkURI, tc.config)
+		require.Nil(t, err)
+		require.Equal(t, tc.mode, mode)
+	}
 }
