@@ -14,141 +14,103 @@
 package model
 
 import (
-	"github.com/pingcap/check"
-	timodel "github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/types"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
+	"sort"
+	"testing"
+
+	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/parser/types"
+	"github.com/pingcap/tiflow/pkg/sink"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-type columnFlagTypeSuite struct{}
+func TestSetFlag(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&columnFlagTypeSuite{})
-
-func (s *columnFlagTypeSuite) TestSetFlag(c *check.C) {
-	defer testleak.AfterTest(c)()
 	var flag ColumnFlagType
 	flag.SetIsBinary()
 	flag.SetIsGeneratedColumn()
-	c.Assert(flag.IsBinary(), check.IsTrue)
-	c.Assert(flag.IsHandleKey(), check.IsFalse)
-	c.Assert(flag.IsGeneratedColumn(), check.IsTrue)
+	require.True(t, flag.IsBinary())
+	require.False(t, flag.IsHandleKey())
+	require.True(t, flag.IsGeneratedColumn())
 	flag.UnsetIsBinary()
-	c.Assert(flag.IsBinary(), check.IsFalse)
+	require.False(t, flag.IsBinary())
 	flag.SetIsMultipleKey()
 	flag.SetIsUniqueKey()
-	c.Assert(flag.IsMultipleKey() && flag.IsUniqueKey(), check.IsTrue)
+	require.True(t, flag.IsMultipleKey() && flag.IsUniqueKey())
 	flag.UnsetIsUniqueKey()
 	flag.UnsetIsGeneratedColumn()
 	flag.UnsetIsMultipleKey()
-	c.Assert(flag.IsUniqueKey() || flag.IsGeneratedColumn() || flag.IsMultipleKey(), check.IsFalse)
+	require.False(t, flag.IsUniqueKey() || flag.IsGeneratedColumn() || flag.IsMultipleKey())
 
 	flag = ColumnFlagType(0)
 	flag.SetIsHandleKey()
 	flag.SetIsPrimaryKey()
 	flag.SetIsUnsigned()
-	c.Assert(flag.IsHandleKey() && flag.IsPrimaryKey() && flag.IsUnsigned(), check.IsTrue)
+	require.True(t, flag.IsHandleKey() && flag.IsPrimaryKey() && flag.IsUnsigned())
 	flag.UnsetIsHandleKey()
 	flag.UnsetIsPrimaryKey()
 	flag.UnsetIsUnsigned()
-	c.Assert(flag.IsHandleKey() || flag.IsPrimaryKey() || flag.IsUnsigned(), check.IsFalse)
+	require.False(t, flag.IsHandleKey() || flag.IsPrimaryKey() || flag.IsUnsigned())
 	flag.SetIsNullable()
-	c.Assert(flag.IsNullable(), check.IsTrue)
+	require.True(t, flag.IsNullable())
 	flag.UnsetIsNullable()
-	c.Assert(flag.IsNullable(), check.IsFalse)
+	require.False(t, flag.IsNullable())
 }
 
-func (s *columnFlagTypeSuite) TestFlagValue(c *check.C) {
-	defer testleak.AfterTest(c)()
-	c.Assert(BinaryFlag, check.Equals, ColumnFlagType(0b1))
-	c.Assert(HandleKeyFlag, check.Equals, ColumnFlagType(0b10))
-	c.Assert(GeneratedColumnFlag, check.Equals, ColumnFlagType(0b100))
-	c.Assert(PrimaryKeyFlag, check.Equals, ColumnFlagType(0b1000))
-	c.Assert(UniqueKeyFlag, check.Equals, ColumnFlagType(0b10000))
-	c.Assert(MultipleKeyFlag, check.Equals, ColumnFlagType(0b100000))
-	c.Assert(NullableFlag, check.Equals, ColumnFlagType(0b1000000))
+func TestFlagValue(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, ColumnFlagType(0b1), BinaryFlag)
+	require.Equal(t, ColumnFlagType(0b1), BinaryFlag)
+	require.Equal(t, ColumnFlagType(0b10), HandleKeyFlag)
+	require.Equal(t, ColumnFlagType(0b100), GeneratedColumnFlag)
+	require.Equal(t, ColumnFlagType(0b1000), PrimaryKeyFlag)
+	require.Equal(t, ColumnFlagType(0b10000), UniqueKeyFlag)
+	require.Equal(t, ColumnFlagType(0b100000), MultipleKeyFlag)
+	require.Equal(t, ColumnFlagType(0b1000000), NullableFlag)
 }
 
-type commonDataStructureSuite struct{}
-
-var _ = check.Suite(&commonDataStructureSuite{})
-
-func (s *commonDataStructureSuite) TestTableNameFuncs(c *check.C) {
-	defer testleak.AfterTest(c)()
-	t := &TableName{
+func TestTableNameFuncs(t *testing.T) {
+	t.Parallel()
+	tbl := &TableName{
 		Schema:  "test",
 		Table:   "t1",
 		TableID: 1071,
 	}
-	c.Assert(t.String(), check.Equals, "test.t1")
-	c.Assert(t.QuoteString(), check.Equals, "`test`.`t1`")
-	c.Assert(t.GetSchema(), check.Equals, "test")
-	c.Assert(t.GetTable(), check.Equals, "t1")
-	c.Assert(t.GetTableID(), check.Equals, int64(1071))
+	require.Equal(t, "test.t1", tbl.String())
+	require.Equal(t, "`test`.`t1`", tbl.QuoteString())
+	require.Equal(t, "test", tbl.GetSchema())
+	require.Equal(t, "t1", tbl.GetTable())
+	require.Equal(t, int64(1071), tbl.GetTableID())
 }
 
-func (s *commonDataStructureSuite) TestRowChangedEventFuncs(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestRowChangedEventFuncs(t *testing.T) {
+	t.Parallel()
 	deleteRow := &RowChangedEvent{
-		Table: &TableName{
-			Schema: "test",
-			Table:  "t1",
+		TableInfo: &TableInfo{
+			TableName: TableName{
+				Schema: "test",
+				Table:  "t1",
+			},
 		},
-		PreColumns: []*Column{
+		PreColumns: []*ColumnData{
 			{
-				Name:  "a",
-				Value: 1,
-				Flag:  HandleKeyFlag | PrimaryKeyFlag,
+				ColumnID: 1,
+				Value:    1,
 			}, {
-				Name:  "b",
-				Value: 2,
-				Flag:  0,
+				ColumnID: 2,
+				Value:    2,
 			},
 		},
 	}
-	expectedKeyCols := []*Column{
-		{
-			Name:  "a",
-			Value: 1,
-			Flag:  HandleKeyFlag | PrimaryKeyFlag,
-		},
-	}
-	c.Assert(deleteRow.IsDelete(), check.IsTrue)
-	c.Assert(deleteRow.PrimaryKeyColumns(), check.DeepEquals, expectedKeyCols)
-	c.Assert(deleteRow.HandleKeyColumns(), check.DeepEquals, expectedKeyCols)
-
-	insertRow := &RowChangedEvent{
-		Table: &TableName{
-			Schema: "test",
-			Table:  "t1",
-		},
-		Columns: []*Column{
-			{
-				Name:  "a",
-				Value: 1,
-				Flag:  HandleKeyFlag,
-			}, {
-				Name:  "b",
-				Value: 2,
-				Flag:  0,
-			},
-		},
-	}
-	expectedPrimaryKeyCols := []*Column{}
-	expectedHandleKeyCols := []*Column{
-		{
-			Name:  "a",
-			Value: 1,
-			Flag:  HandleKeyFlag,
-		},
-	}
-	c.Assert(insertRow.IsDelete(), check.IsFalse)
-	c.Assert(insertRow.PrimaryKeyColumns(), check.DeepEquals, expectedPrimaryKeyCols)
-	c.Assert(insertRow.HandleKeyColumns(), check.DeepEquals, expectedHandleKeyCols)
+	require.True(t, deleteRow.IsDelete())
 }
 
-func (s *commonDataStructureSuite) TestColumnValueString(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestColumnValueString(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		val      interface{}
 		expected string
@@ -173,23 +135,14 @@ func (s *commonDataStructureSuite) TestColumnValueString(c *check.C) {
 	}
 	for _, tc := range testCases {
 		s := ColumnValueString(tc.val)
-		c.Assert(s, check.Equals, tc.expected)
+		require.Equal(t, tc.expected, s)
 	}
 }
 
-func (s *commonDataStructureSuite) TestFromTiColumnInfo(c *check.C) {
-	defer testleak.AfterTest(c)()
-	col := &ColumnInfo{}
-	col.FromTiColumnInfo(&timodel.ColumnInfo{
-		Name:      timodel.CIStr{O: "col1"},
-		FieldType: types.FieldType{Tp: 3},
-	})
-	c.Assert(col.Name, check.Equals, "col1")
-	c.Assert(col.Type, check.Equals, uint8(3))
-}
-
-func (s *commonDataStructureSuite) TestDDLEventFromJob(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestDDLEventFromJob(t *testing.T) {
+	t.Parallel()
+	ft := types.NewFieldType(mysql.TypeUnspecified)
+	ft.SetFlag(mysql.PriKeyFlag)
 	job := &timodel.Job{
 		ID:         1071,
 		TableID:    49,
@@ -200,10 +153,10 @@ func (s *commonDataStructureSuite) TestDDLEventFromJob(c *check.C) {
 		BinlogInfo: &timodel.HistoryInfo{
 			TableInfo: &timodel.TableInfo{
 				ID:   49,
-				Name: timodel.CIStr{O: "t1"},
+				Name: pmodel.CIStr{O: "t1"},
 				Columns: []*timodel.ColumnInfo{
-					{ID: 1, Name: timodel.CIStr{O: "id"}, FieldType: types.FieldType{Flag: mysql.PriKeyFlag}, State: timodel.StatePublic},
-					{ID: 2, Name: timodel.CIStr{O: "a"}, FieldType: types.FieldType{}, State: timodel.StatePublic},
+					{ID: 1, Name: pmodel.CIStr{O: "id"}, FieldType: *ft, State: timodel.StatePublic},
+					{ID: 2, Name: pmodel.CIStr{O: "a"}, FieldType: types.FieldType{}, State: timodel.StatePublic},
 				},
 			},
 			FinishedTS: 420536581196873729,
@@ -217,19 +170,504 @@ func (s *commonDataStructureSuite) TestDDLEventFromJob(c *check.C) {
 		},
 		TableInfo: &timodel.TableInfo{
 			ID:   49,
-			Name: timodel.CIStr{O: "t1"},
+			Name: pmodel.CIStr{O: "t1"},
 			Columns: []*timodel.ColumnInfo{
-				{ID: 1, Name: timodel.CIStr{O: "id"}, FieldType: types.FieldType{Flag: mysql.PriKeyFlag}, State: timodel.StatePublic},
+				{ID: 1, Name: pmodel.CIStr{O: "id"}, FieldType: *ft, State: timodel.StatePublic},
 			},
 		},
 	}
+	tableInfo := WrapTableInfo(job.SchemaID, job.SchemaName, job.BinlogInfo.FinishedTS, job.BinlogInfo.TableInfo)
 	event := &DDLEvent{}
-	event.FromJob(job, preTableInfo)
-	c.Assert(event.StartTs, check.Equals, uint64(420536581131337731))
-	c.Assert(event.TableInfo.TableID, check.Equals, int64(49))
-	c.Assert(event.PreTableInfo.ColumnInfo, check.HasLen, 1)
+	event.FromJob(job, preTableInfo, tableInfo)
+	require.Equal(t, uint64(420536581131337731), event.StartTs)
+	require.Equal(t, int64(49), event.TableInfo.TableName.TableID)
+	require.Equal(t, 1, len(event.PreTableInfo.TableInfo.Columns))
 
 	event = &DDLEvent{}
-	event.FromJob(job, nil)
-	c.Assert(event.PreTableInfo, check.IsNil)
+	event.FromJob(job, nil, nil)
+	require.Nil(t, event.PreTableInfo)
+}
+
+func TestRenameTables(t *testing.T) {
+	ft := types.NewFieldType(mysql.TypeUnspecified)
+	ft.SetFlag(mysql.PriKeyFlag | mysql.UniqueFlag)
+	job := &timodel.Job{
+		ID:         71,
+		TableID:    69,
+		SchemaName: "test1",
+		Type:       timodel.ActionRenameTables,
+		StartTS:    432853521879007233,
+		Query:      "rename table test1.t1 to test1.t10, test1.t2 to test1.t20",
+		BinlogInfo: &timodel.HistoryInfo{
+			FinishedTS: 432853521879007238,
+			MultipleTableInfos: []*timodel.TableInfo{
+				{
+					ID:   67,
+					Name: pmodel.CIStr{O: "t10"},
+					Columns: []*timodel.ColumnInfo{
+						{
+							ID:        1,
+							Name:      pmodel.CIStr{O: "id"},
+							FieldType: *ft,
+							State:     timodel.StatePublic,
+						},
+					},
+				},
+				{
+					ID:   69,
+					Name: pmodel.CIStr{O: "t20"},
+					Columns: []*timodel.ColumnInfo{
+						{
+							ID:        1,
+							Name:      pmodel.CIStr{O: "id"},
+							FieldType: *ft,
+							State:     timodel.StatePublic,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	preTableInfo := &TableInfo{
+		TableName: TableName{
+			Schema:  "test1",
+			Table:   "t1",
+			TableID: 67,
+		},
+		TableInfo: &timodel.TableInfo{
+			ID:   67,
+			Name: pmodel.CIStr{O: "t1"},
+			Columns: []*timodel.ColumnInfo{
+				{
+					ID:        1,
+					Name:      pmodel.CIStr{O: "id"},
+					FieldType: *ft,
+					State:     timodel.StatePublic,
+				},
+			},
+		},
+	}
+
+	tableInfo := &TableInfo{
+		TableName: TableName{
+			Schema:  "test1",
+			Table:   "t10",
+			TableID: 67,
+		},
+		TableInfo: &timodel.TableInfo{
+			ID:   67,
+			Name: pmodel.CIStr{O: "t10"},
+			Columns: []*timodel.ColumnInfo{
+				{
+					ID:        1,
+					Name:      pmodel.CIStr{O: "id"},
+					FieldType: *ft,
+					State:     timodel.StatePublic,
+				},
+			},
+		},
+	}
+
+	event := &DDLEvent{}
+	event.FromJobWithArgs(job, preTableInfo, tableInfo, "test1", "test1")
+	require.Equal(t, event.PreTableInfo.TableName.TableID, int64(67))
+	require.Equal(t, event.PreTableInfo.TableName.Table, "t1")
+	require.Len(t, event.PreTableInfo.TableInfo.Columns, 1)
+	require.Equal(t, event.TableInfo.TableName.TableID, int64(67))
+	require.Equal(t, event.TableInfo.TableName.Table, "t10")
+	require.Len(t, event.TableInfo.TableInfo.Columns, 1)
+	require.Equal(t, event.Query, "RENAME TABLE `test1`.`t1` TO `test1`.`t10`")
+	require.Equal(t, event.Type, timodel.ActionRenameTable)
+
+	preTableInfo = &TableInfo{
+		TableName: TableName{
+			Schema:  "test1",
+			Table:   "t2",
+			TableID: 69,
+		},
+		TableInfo: &timodel.TableInfo{
+			ID:   69,
+			Name: pmodel.CIStr{O: "t2"},
+			Columns: []*timodel.ColumnInfo{
+				{
+					ID:        1,
+					Name:      pmodel.CIStr{O: "id"},
+					FieldType: *ft,
+					State:     timodel.StatePublic,
+				},
+			},
+		},
+	}
+
+	tableInfo = &TableInfo{
+		TableName: TableName{
+			Schema:  "test1",
+			Table:   "t20",
+			TableID: 69,
+		},
+		TableInfo: &timodel.TableInfo{
+			ID:   69,
+			Name: pmodel.CIStr{O: "t20"},
+			Columns: []*timodel.ColumnInfo{
+				{
+					ID:        1,
+					Name:      pmodel.CIStr{O: "id"},
+					FieldType: *ft,
+					State:     timodel.StatePublic,
+				},
+			},
+		},
+	}
+
+	event = &DDLEvent{}
+	event.FromJobWithArgs(job, preTableInfo, tableInfo, "test1", "test1")
+	require.Equal(t, event.PreTableInfo.TableName.TableID, int64(69))
+	require.Equal(t, event.PreTableInfo.TableName.Table, "t2")
+	require.Len(t, event.PreTableInfo.TableInfo.Columns, 1)
+	require.Equal(t, event.TableInfo.TableName.TableID, int64(69))
+	require.Equal(t, event.TableInfo.TableName.Table, "t20")
+	require.Len(t, event.TableInfo.TableInfo.Columns, 1)
+	require.Equal(t, event.Query, "RENAME TABLE `test1`.`t2` TO `test1`.`t20`")
+	require.Equal(t, event.Type, timodel.ActionRenameTable)
+}
+
+func TestExchangeTablePartition(t *testing.T) {
+	ft := types.NewFieldType(mysql.TypeUnspecified)
+	ft.SetFlag(mysql.PriKeyFlag | mysql.UniqueFlag)
+	job := &timodel.Job{
+		ID:         71,
+		TableID:    69,
+		SchemaName: "test1",
+		Type:       timodel.ActionExchangeTablePartition,
+		StartTS:    432853521879007233,
+		Query:      "alter table t1 exchange partition p0 with table t2",
+		BinlogInfo: &timodel.HistoryInfo{
+			FinishedTS: 432853521879007238,
+		},
+	}
+
+	// source table
+	preTableInfo := &TableInfo{
+		TableName: TableName{
+			Schema:  "test2",
+			Table:   "t2",
+			TableID: 67,
+		},
+		TableInfo: &timodel.TableInfo{
+			ID:   67,
+			Name: pmodel.CIStr{O: "t1"},
+			Columns: []*timodel.ColumnInfo{
+				{
+					ID:        1,
+					Name:      pmodel.CIStr{O: "id"},
+					FieldType: *ft,
+					State:     timodel.StatePublic,
+				},
+			},
+		},
+	}
+
+	// target table
+	tableInfo := &TableInfo{
+		TableName: TableName{
+			Schema:  "test1",
+			Table:   "t1",
+			TableID: 69,
+		},
+		TableInfo: &timodel.TableInfo{
+			ID:   69,
+			Name: pmodel.CIStr{O: "t10"},
+			Columns: []*timodel.ColumnInfo{
+				{
+					ID:        1,
+					Name:      pmodel.CIStr{O: "id"},
+					FieldType: *ft,
+					State:     timodel.StatePublic,
+				},
+			},
+		},
+	}
+
+	event := &DDLEvent{}
+	event.FromJob(job, preTableInfo, tableInfo)
+	require.Equal(t, event.PreTableInfo.TableName.TableID, int64(67))
+	require.Equal(t, event.PreTableInfo.TableName.Table, "t2")
+	require.Len(t, event.PreTableInfo.TableInfo.Columns, 1)
+	require.Equal(t, event.TableInfo.TableName.TableID, int64(69))
+	require.Equal(t, event.TableInfo.TableName.Table, "t1")
+	require.Len(t, event.TableInfo.TableInfo.Columns, 1)
+	require.Equal(t, "ALTER TABLE `test1`.`t1` EXCHANGE PARTITION `p0` WITH TABLE `test2`.`t2`", event.Query)
+	require.Equal(t, event.Type, timodel.ActionExchangeTablePartition)
+}
+
+func TestSortRowChangedEvent(t *testing.T) {
+	events := []*RowChangedEvent{
+		{
+			PreColumns: []*ColumnData{{}},
+			Columns:    []*ColumnData{{}},
+		},
+		{
+			Columns: []*ColumnData{{}},
+		},
+		{
+			PreColumns: []*ColumnData{{}},
+		},
+	}
+	assert.True(t, events[0].IsUpdate())
+	assert.True(t, events[1].IsInsert())
+	assert.True(t, events[2].IsDelete())
+	sort.Sort(txnRows(events))
+	assert.True(t, events[0].IsDelete())
+	assert.True(t, events[1].IsUpdate())
+	assert.True(t, events[2].IsInsert())
+}
+
+func TestTrySplitAndSortUpdateEventNil(t *testing.T) {
+	t.Parallel()
+
+	events := []*RowChangedEvent{nil}
+	result, err := trySplitAndSortUpdateEvent(events)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(result))
+}
+
+func TestTrySplitAndSortUpdateEventEmpty(t *testing.T) {
+	t.Parallel()
+
+	events := []*RowChangedEvent{
+		{
+			StartTs:  1,
+			CommitTs: 2,
+		},
+	}
+	result, err := trySplitAndSortUpdateEvent(events)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(result))
+}
+
+func TestTrySplitAndSortUpdateEvent(t *testing.T) {
+	t.Parallel()
+
+	// Update primary key.
+	tableInfoWithPrimaryKey := BuildTableInfo("test", "t", []*Column{
+		{
+			Name: "col1",
+			Flag: BinaryFlag,
+		},
+		{
+			Name: "col2",
+			Flag: HandleKeyFlag | PrimaryKeyFlag,
+		},
+	}, [][]int{{1}})
+	events := []*RowChangedEvent{
+		{
+			CommitTs:  1,
+			TableInfo: tableInfoWithPrimaryKey,
+			Columns: Columns2ColumnDatas([]*Column{
+				{
+					Name:  "col1",
+					Flag:  BinaryFlag,
+					Value: "col1-value-updated",
+				},
+				{
+					Name:  "col2",
+					Flag:  HandleKeyFlag | PrimaryKeyFlag,
+					Value: "col2-value-updated",
+				},
+			}, tableInfoWithPrimaryKey),
+			PreColumns: Columns2ColumnDatas([]*Column{
+				{
+					Name:  "col1",
+					Value: "col1-value",
+				},
+				{
+					Name:  "col2",
+					Value: "col2-value",
+				},
+			}, tableInfoWithPrimaryKey),
+		},
+	}
+	result, err := trySplitAndSortUpdateEvent(events)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(result))
+	require.True(t, result[0].IsDelete())
+	require.True(t, result[1].IsInsert())
+
+	// Update unique key.
+	tableInfoWithUniqueKey := BuildTableInfo("test", "t", []*Column{
+		{
+			Name: "col1",
+			Flag: BinaryFlag,
+		},
+		{
+			Name: "col2",
+			Flag: UniqueKeyFlag | NullableFlag,
+		},
+	}, [][]int{{1}})
+	events = []*RowChangedEvent{
+		{
+			CommitTs:  1,
+			TableInfo: tableInfoWithUniqueKey,
+			Columns: Columns2ColumnDatas([]*Column{
+				{
+					Name:  "col1",
+					Value: "col1-value-updated",
+				},
+				{
+					Name:  "col2",
+					Value: "col2-value-updated",
+				},
+			}, tableInfoWithUniqueKey),
+			PreColumns: Columns2ColumnDatas([]*Column{
+				{
+					Name:  "col1",
+					Value: "col1-value",
+				},
+				{
+					Name:  "col2",
+					Value: "col2-value",
+				},
+			}, tableInfoWithUniqueKey),
+		},
+	}
+	result, err = trySplitAndSortUpdateEvent(events)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(result))
+	require.True(t, result[0].IsDelete())
+	require.True(t, result[0].IsDelete())
+	require.True(t, result[1].IsInsert())
+
+	// Update non-handle key.
+	events = []*RowChangedEvent{
+		{
+			CommitTs:  1,
+			TableInfo: tableInfoWithPrimaryKey,
+			Columns: Columns2ColumnDatas([]*Column{
+				{
+					Name:  "col1",
+					Value: "col1-value-updated",
+				},
+				{
+					Name:  "col2",
+					Value: "col2-value",
+				},
+			}, tableInfoWithPrimaryKey),
+			PreColumns: Columns2ColumnDatas([]*Column{
+				{
+					Name:  "col1",
+					Value: "col1-value",
+				},
+				{
+					Name:  "col2",
+					Value: "col2-value",
+				},
+			}, tableInfoWithPrimaryKey),
+		},
+	}
+	result, err = trySplitAndSortUpdateEvent(events)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(result))
+}
+
+func TestTxnTrySplitAndSortUpdateEvent(t *testing.T) {
+	columns := []*Column{
+		{
+			Name:  "col1",
+			Flag:  BinaryFlag,
+			Value: "col1-value",
+		},
+		{
+			Name:  "col2",
+			Flag:  HandleKeyFlag | UniqueKeyFlag | PrimaryKeyFlag,
+			Value: "col2-value-updated",
+		},
+	}
+	preColumns := []*Column{
+		{
+			Name:  "col1",
+			Flag:  BinaryFlag,
+			Value: "col1-value",
+		},
+		{
+			Name:  "col2",
+			Flag:  HandleKeyFlag | UniqueKeyFlag | PrimaryKeyFlag,
+			Value: "col2-value",
+		},
+	}
+	tableInfo := BuildTableInfo("test", "t", columns, [][]int{{1}})
+	ukUpdatedEvent := &RowChangedEvent{
+		TableInfo:  tableInfo,
+		PreColumns: Columns2ColumnDatas(preColumns, tableInfo),
+		Columns:    Columns2ColumnDatas(columns, tableInfo),
+	}
+	txn := &SingleTableTxn{
+		Rows: []*RowChangedEvent{ukUpdatedEvent},
+	}
+
+	outputRawChangeEvent := true
+	notOutputRawChangeEvent := false
+	err := txn.TrySplitAndSortUpdateEvent(sink.KafkaScheme, outputRawChangeEvent)
+	require.NoError(t, err)
+	require.Len(t, txn.Rows, 1)
+	err = txn.TrySplitAndSortUpdateEvent(sink.KafkaScheme, notOutputRawChangeEvent)
+	require.NoError(t, err)
+	require.Len(t, txn.Rows, 2)
+
+	txn = &SingleTableTxn{
+		Rows: []*RowChangedEvent{ukUpdatedEvent},
+	}
+	err = txn.TrySplitAndSortUpdateEvent(sink.MySQLScheme, outputRawChangeEvent)
+	require.NoError(t, err)
+	require.Len(t, txn.Rows, 1)
+	err = txn.TrySplitAndSortUpdateEvent(sink.MySQLScheme, notOutputRawChangeEvent)
+	require.NoError(t, err)
+	require.Len(t, txn.Rows, 1)
+
+	txn2 := &SingleTableTxn{
+		Rows: []*RowChangedEvent{ukUpdatedEvent, ukUpdatedEvent},
+	}
+	err = txn.TrySplitAndSortUpdateEvent(sink.MySQLScheme, outputRawChangeEvent)
+	require.NoError(t, err)
+	require.Len(t, txn2.Rows, 2)
+	err = txn.TrySplitAndSortUpdateEvent(sink.MySQLScheme, notOutputRawChangeEvent)
+	require.NoError(t, err)
+	require.Len(t, txn2.Rows, 2)
+}
+
+func TestToRedoLog(t *testing.T) {
+	cols := []*Column{
+		{
+			Name: "col1",
+			Flag: BinaryFlag,
+		},
+		{
+			Name: "col2",
+			Flag: HandleKeyFlag | UniqueKeyFlag,
+		},
+	}
+	tableInfo := BuildTableInfo("test", "t", cols, [][]int{{1}})
+	event := &RowChangedEvent{
+		StartTs:         100,
+		CommitTs:        1000,
+		PhysicalTableID: 1,
+		TableInfo:       tableInfo,
+		Columns: Columns2ColumnDatas([]*Column{
+			{
+				Name:  "col1",
+				Value: "col1-value",
+			},
+			{
+				Name:  "col2",
+				Value: "col2-value-updated",
+			},
+		}, tableInfo),
+	}
+	eventInRedoLog := event.ToRedoLog()
+	require.Equal(t, event.StartTs, eventInRedoLog.RedoRow.Row.StartTs)
+	require.Equal(t, event.CommitTs, eventInRedoLog.RedoRow.Row.CommitTs)
+	require.Equal(t, event.GetTableID(), eventInRedoLog.RedoRow.Row.Table.TableID)
+	require.Equal(t, event.TableInfo.GetSchemaName(), eventInRedoLog.RedoRow.Row.Table.Schema)
+	require.Equal(t, event.TableInfo.GetTableName(), eventInRedoLog.RedoRow.Row.Table.Table)
+	require.Equal(t, event.Columns, Columns2ColumnDatas(eventInRedoLog.RedoRow.Row.Columns, tableInfo))
 }
