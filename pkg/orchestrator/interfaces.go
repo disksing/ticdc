@@ -16,7 +16,7 @@ package orchestrator
 import (
 	"context"
 
-	"github.com/pingcap/ticdc/pkg/orchestrator/util"
+	"github.com/pingcap/tiflow/pkg/orchestrator/util"
 )
 
 // Reactor is a stateful transform of states.
@@ -34,6 +34,9 @@ type DataPatch interface {
 type ReactorState interface {
 	// Update is called by EtcdWorker to notify the Reactor of a latest change to the Etcd state.
 	Update(key util.EtcdKey, value []byte, isInit bool) error
+
+	// UpdatePendingChange is called by EtcdWorker to notify the Reactor to apply the pending changes.
+	UpdatePendingChange()
 
 	// GetPatches is called by EtcdWorker, and should return many slices of data patches that represents the changes
 	// that a Reactor wants to apply to Etcd.
@@ -66,12 +69,4 @@ func (s *SingleDataPatch) Patch(valueMap map[util.EtcdKey][]byte, changedSet map
 		valueMap[s.Key] = newValue
 	}
 	return nil
-}
-
-// MultiDatePatch represents an update to many keys
-type MultiDatePatch func(valueMap map[util.EtcdKey][]byte, changedSet map[util.EtcdKey]struct{}) error
-
-// Patch implements the DataPatch interface
-func (m MultiDatePatch) Patch(valueMap map[util.EtcdKey][]byte, changedSet map[util.EtcdKey]struct{}) error {
-	return m(valueMap, changedSet)
 }
