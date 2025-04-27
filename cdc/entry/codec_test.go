@@ -14,57 +14,27 @@
 package entry
 
 import (
+	"encoding/hex"
 	"testing"
 
-	"github.com/pingcap/check"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
-	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/tablecodec"
-	"github.com/pingcap/tidb/util/codec"
+	"github.com/stretchr/testify/require"
 )
 
-func Test(t *testing.T) { check.TestingT(t) }
-
-type codecSuite struct {
-}
-
-var _ = check.Suite(&codecSuite{})
-
-func (s *codecSuite) TestDecodeRecordKey(c *check.C) {
-	defer testleak.AfterTest(c)()
-	recordPrefix := tablecodec.GenTableRecordPrefix(12345)
-	key := tablecodec.EncodeRecordKey(recordPrefix, kv.IntHandle(67890))
-	key, tableID, err := decodeTableID(key)
-	c.Assert(err, check.IsNil)
-	c.Assert(tableID, check.Equals, int64(12345))
-	key, recordID, err := decodeRecordID(key)
-	c.Assert(err, check.IsNil)
-	c.Assert(recordID, check.Equals, int64(67890))
-	c.Assert(len(key), check.Equals, 0)
-}
-
-type decodeMetaKeySuite struct {
-}
-
-var _ = check.Suite(&decodeMetaKeySuite{})
-
-func (s *decodeMetaKeySuite) TestDecodeListData(c *check.C) {
-	defer testleak.AfterTest(c)()
-	key := []byte("hello")
-	var index int64 = 3
-
-	meta, err := decodeMetaKey(buildMetaKey(key, index))
-	c.Assert(err, check.IsNil)
-	c.Assert(meta.getType(), check.Equals, ListData)
-	list := meta.(metaListData)
-	c.Assert(list.key, check.Equals, string(key))
-	c.Assert(list.index, check.Equals, index)
-}
-
-func buildMetaKey(key []byte, index int64) []byte {
-	ek := make([]byte, 0, len(metaPrefix)+len(key)+36)
-	ek = append(ek, metaPrefix...)
-	ek = codec.EncodeBytes(ek, key)
-	ek = codec.EncodeUint(ek, uint64(ListData))
-	return codec.EncodeInt(ek, index)
+func TestDecodeTableID(t *testing.T) {
+	/*
+		"7480000000000000685f728000000000000001"
+		└─## decode hex key
+		  └─"t\200\000\000\000\000\000\000h_r\200\000\000\000\000\000\000\001"
+		    ├─## table prefix
+		    │ └─table: 104
+		    └─## table row key
+		      ├─table: 104
+		      └─row: 1
+	*/
+	key := "7480000000000000685f728000000000000001"
+	keyBytes, err := hex.DecodeString(key)
+	require.NoError(t, err)
+	tableID, err := DecodeTableID(keyBytes)
+	require.NoError(t, err)
+	require.Equal(t, tableID, int64(104))
 }
