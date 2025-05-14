@@ -22,98 +22,149 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/cdc/model"
-	tablepipeline "github.com/pingcap/ticdc/cdc/processor/pipeline"
-	cdcContext "github.com/pingcap/ticdc/pkg/context"
-	cerrors "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/orchestrator"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/cdc/vars"
+	"github.com/pingcap/tiflow/pkg/config"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/etcd"
+	"github.com/pingcap/tiflow/pkg/orchestrator"
+	"github.com/pingcap/tiflow/pkg/upstream"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
 type commandTp int
 
 const (
-	commandTpUnknow commandTp = iota //nolint:varcheck,deadcode
-	commandTpClose
+	commandTpUnknown commandTp = iota
 	commandTpWriteDebugInfo
+	processorLogsWarnDuration = 1 * time.Second
 )
 
 type command struct {
 	tp      commandTp
 	payload interface{}
-	done    chan struct{}
+	done    chan<- error
 }
 
 // Manager is a manager of processor, which maintains the state and behavior of processors
-type Manager struct {
-	processors map[model.ChangeFeedID]*processor
+type Manager interface {
+	orchestrator.Reactor
 
-	commandQueue chan *command
+	// Close the manager itself and all processors. Can't be called with `Tick` concurrently.
+	// After it's called, all other methods shouldn't be called any more.
+	Close()
 
-	newProcessor func(cdcContext.Context) *processor
+	WriteDebugInfo(ctx context.Context, w io.Writer, done chan<- error)
+}
+
+// managerImpl is a manager of processor, which maintains the state and behavior of processors
+type managerImpl struct {
+	captureInfo     *model.CaptureInfo
+	liveness        *model.Liveness
+	processors      map[model.ChangeFeedID]*processor
+	commandQueue    chan *command
+	upstreamManager *upstream.Manager
+
+	newProcessor func(
+		*model.ChangeFeedInfo,
+		*model.ChangeFeedStatus,
+		*model.CaptureInfo,
+		model.ChangeFeedID,
+		*upstream.Upstream,
+		*model.Liveness,
+		uint64,
+		*config.SchedulerConfig,
+		etcd.OwnerCaptureInfoClient,
+		*vars.GlobalVars,
+	) *processor
+	cfg        *config.SchedulerConfig
+	globalVars *vars.GlobalVars
+
+	metricProcessorCloseDuration prometheus.Observer
 }
 
 // NewManager creates a new processor manager
-func NewManager() *Manager {
-	return &Manager{
-		processors:   make(map[model.ChangeFeedID]*processor),
-		commandQueue: make(chan *command, 4),
-		newProcessor: newProcessor,
+func NewManager(
+	captureInfo *model.CaptureInfo,
+	upstreamManager *upstream.Manager,
+	liveness *model.Liveness,
+	cfg *config.SchedulerConfig,
+	globalVars *vars.GlobalVars,
+) Manager {
+	return &managerImpl{
+		captureInfo:                  captureInfo,
+		liveness:                     liveness,
+		processors:                   make(map[model.ChangeFeedID]*processor),
+		commandQueue:                 make(chan *command, 4),
+		upstreamManager:              upstreamManager,
+		newProcessor:                 NewProcessor,
+		metricProcessorCloseDuration: processorCloseDuration,
+		cfg:                          cfg,
+		globalVars:                   globalVars,
 	}
-}
-
-// NewManager4Test creates a new processor manager for test
-func NewManager4Test(
-	createTablePipeline func(ctx cdcContext.Context, tableID model.TableID, replicaInfo *model.TableReplicaInfo) (tablepipeline.TablePipeline, error),
-) *Manager {
-	m := NewManager()
-	m.newProcessor = func(ctx cdcContext.Context) *processor {
-		return newProcessor4Test(ctx, createTablePipeline)
-	}
-	return m
 }
 
 // Tick implements the `orchestrator.State` interface
 // the `state` parameter is sent by the etcd worker, the `state` must be a snapshot of KVs in etcd
 // the Tick function of Manager create or remove processor instances according to the specified `state`, or pass the `state` to processor instances
-func (m *Manager) Tick(stdCtx context.Context, state orchestrator.ReactorState) (nextState orchestrator.ReactorState, err error) {
-	ctx := stdCtx.(cdcContext.Context)
-	globalState := state.(*model.GlobalReactorState)
-	if err := m.handleCommand(); err != nil {
-		return state, err
-	}
-	captureID := ctx.GlobalVars().CaptureInfo.ID
+func (m *managerImpl) Tick(stdCtx context.Context, state orchestrator.ReactorState) (nextState orchestrator.ReactorState, err error) {
+	globalState := state.(*orchestrator.GlobalReactorState)
+	m.handleCommand()
+
 	var inactiveChangefeedCount int
 	for changefeedID, changefeedState := range globalState.Changefeeds {
-		if !changefeedState.Active(captureID) {
+		if !changefeedState.Active(m.captureInfo.ID) {
 			inactiveChangefeedCount++
 			m.closeProcessor(changefeedID)
 			continue
 		}
-		ctx := cdcContext.WithChangefeedVars(ctx, &cdcContext.ChangefeedVars{
-			ID:   changefeedID,
-			Info: changefeedState.Info,
-		})
-		processor, exist := m.processors[changefeedID]
+		currentChangefeedEpoch := changefeedState.Info.Epoch
+		p, exist := m.processors[changefeedID]
 		if !exist {
-			if changefeedState.Status.AdminJobType.IsStopState() || changefeedState.TaskStatuses[captureID].AdminJobType.IsStopState() {
-				continue
-			}
-			// the processor should start after at least one table has been added to this capture
-			taskStatus := changefeedState.TaskStatuses[captureID]
-			if taskStatus == nil || (len(taskStatus.Tables) == 0 && len(taskStatus.Operation) == 0) {
-				continue
+			up, ok := m.upstreamManager.Get(changefeedState.Info.UpstreamID)
+			if !ok {
+				upstreamInfo := globalState.Upstreams[changefeedState.Info.UpstreamID]
+				up = m.upstreamManager.AddUpstream(upstreamInfo)
 			}
 			failpoint.Inject("processorManagerHandleNewChangefeedDelay", nil)
-			processor = m.newProcessor(ctx)
-			m.processors[changefeedID] = processor
+
+			cfg := *m.cfg
+			cfg.ChangefeedSettings = changefeedState.Info.Config.Scheduler
+			p = m.newProcessor(
+				changefeedState.Info, changefeedState.Status,
+				m.captureInfo, changefeedID, up, m.liveness,
+				currentChangefeedEpoch, &cfg, m.globalVars.EtcdClient,
+				m.globalVars)
+			m.processors[changefeedID] = p
 		}
-		if _, err := processor.Tick(ctx, changefeedState); err != nil {
+		if currentChangefeedEpoch != p.changefeedEpoch {
+			// Changefeed has restarted due to error, the processor is stale.
 			m.closeProcessor(changefeedID)
-			if cerrors.ErrReactorFinished.Equal(errors.Cause(err)) {
-				continue
-			}
-			return state, errors.Trace(err)
+			continue
+		}
+		// check if the changefeed is normal before tick
+		if !checkChangefeedNormal(changefeedState) {
+			patchProcessorErr(p.captureInfo, changefeedState,
+				cerror.ErrAdminStopProcessor.GenWithStackByArgs())
+			m.closeProcessor(changefeedID)
+			continue
+		}
+		// check the capture is alive
+		changefeedState.CheckCaptureAlive(p.captureInfo.ID)
+		// check if the task position is created
+		if createTaskPosition(changefeedState, p.captureInfo) {
+			continue
+		}
+		err, warning := p.Tick(stdCtx, changefeedState.Info, changefeedState.Status)
+		if warning != nil {
+			patchProcessorWarning(p.captureInfo, changefeedState, warning)
+		}
+		if err != nil {
+			patchProcessorErr(p.captureInfo, changefeedState, err)
+			// patchProcessorErr have already patched its error to tell the owner
+			// manager can just close the processor and continue to tick other processors
+			m.closeProcessor(changefeedID)
 		}
 	}
 	// check if the processors in memory is leaked
@@ -124,75 +175,197 @@ func (m *Manager) Tick(stdCtx context.Context, state orchestrator.ReactorState) 
 			}
 		}
 	}
+
+	if err := m.upstreamManager.Tick(stdCtx, globalState); err != nil {
+		return state, errors.Trace(err)
+	}
 	return state, nil
 }
 
-func (m *Manager) closeProcessor(changefeedID model.ChangeFeedID) {
-	if processor, exist := m.processors[changefeedID]; exist {
+// checkChangefeedNormal checks if the changefeed is runnable.
+func checkChangefeedNormal(changefeed *orchestrator.ChangefeedReactorState) bool {
+	// check the state in this tick, make sure that the admin job type of the changefeed is not stopped
+	if changefeed.Info.AdminJobType.IsStopState() || changefeed.Status.AdminJobType.IsStopState() {
+		return false
+	}
+	// add a patch to check the changefeed is runnable when applying the patches in the etcd worker.
+	changefeed.CheckChangefeedNormal()
+	return true
+}
+
+// createTaskPosition will create a new task position if a task position does not exist.
+// task position not exist only when the processor is running first in the first tick.
+func createTaskPosition(changefeed *orchestrator.ChangefeedReactorState,
+	captureInfo *model.CaptureInfo,
+) (skipThisTick bool) {
+	if _, exist := changefeed.TaskPositions[captureInfo.ID]; exist {
+		return false
+	}
+	changefeed.PatchTaskPosition(captureInfo.ID,
+		func(position *model.TaskPosition) (*model.TaskPosition, bool, error) {
+			if position == nil {
+				return &model.TaskPosition{}, true, nil
+			}
+			return position, false, nil
+		})
+	return true
+}
+
+func patchProcessorErr(captureInfo *model.CaptureInfo,
+	changefeed *orchestrator.ChangefeedReactorState,
+	err error,
+) {
+	if isProcessorIgnorableError(err) {
+		log.Info("processor exited",
+			zap.String("capture", captureInfo.ID),
+			zap.String("namespace", changefeed.ID.Namespace),
+			zap.String("changefeed", changefeed.ID.ID),
+			zap.Error(err))
+		return
+	}
+	// record error information in etcd
+	var code string
+	if rfcCode, ok := cerror.RFCCode(err); ok {
+		code = string(rfcCode)
+	} else {
+		code = string(cerror.ErrProcessorUnknown.RFCCode())
+	}
+	changefeed.PatchTaskPosition(captureInfo.ID,
+		func(position *model.TaskPosition) (*model.TaskPosition, bool, error) {
+			if position == nil {
+				position = &model.TaskPosition{}
+			}
+			position.Error = &model.RunningError{
+				Time:    time.Now(),
+				Addr:    captureInfo.AdvertiseAddr,
+				Code:    code,
+				Message: err.Error(),
+			}
+			return position, true, nil
+		})
+	log.Error("run processor failed",
+		zap.String("capture", captureInfo.ID),
+		zap.String("namespace", changefeed.ID.Namespace),
+		zap.String("changefeed", changefeed.ID.ID),
+		zap.Error(err))
+}
+
+func patchProcessorWarning(captureInfo *model.CaptureInfo,
+	changefeed *orchestrator.ChangefeedReactorState, err error,
+) {
+	if err == nil {
+		return
+	}
+	var code string
+	if rfcCode, ok := cerror.RFCCode(err); ok {
+		code = string(rfcCode)
+	} else {
+		code = string(cerror.ErrProcessorUnknown.RFCCode())
+	}
+	changefeed.PatchTaskPosition(captureInfo.ID,
+		func(position *model.TaskPosition) (*model.TaskPosition, bool, error) {
+			if position == nil {
+				position = &model.TaskPosition{}
+			}
+			position.Warning = &model.RunningError{
+				Time:    time.Now(),
+				Addr:    captureInfo.AdvertiseAddr,
+				Code:    code,
+				Message: err.Error(),
+			}
+			return position, true, nil
+		})
+}
+
+func (m *managerImpl) closeProcessor(changefeedID model.ChangeFeedID) {
+	processor, exist := m.processors[changefeedID]
+	if exist {
+		startTime := time.Now()
 		err := processor.Close()
+		costTime := time.Since(startTime)
+		if costTime > processorLogsWarnDuration {
+			log.Warn("processor close took too long",
+				zap.String("namespace", changefeedID.Namespace),
+				zap.String("changefeed", changefeedID.ID),
+				zap.String("capture", m.captureInfo.ID),
+				zap.Duration("duration", costTime))
+		}
+		m.metricProcessorCloseDuration.Observe(costTime.Seconds())
 		if err != nil {
-			log.Warn("failed to close processor", zap.Error(err))
+			log.Warn("failed to close processor",
+				zap.String("namespace", changefeedID.Namespace),
+				zap.String("changefeed", changefeedID.ID),
+				zap.Error(err))
 		}
 		delete(m.processors, changefeedID)
 	}
 }
 
-// AsyncClose sends a close signal to Manager and closing all processors
-func (m *Manager) AsyncClose() {
-	m.sendCommand(commandTpClose, nil)
+// Close the manager itself and all processors.
+// Note: This method must not be called with `Tick`. Please be careful.
+func (m *managerImpl) Close() {
+	log.Info("processor.Manager is closing")
+	for changefeedID := range m.processors {
+		m.closeProcessor(changefeedID)
+	}
+	// FIXME: we should drain command queue and signal callers an error.
 }
 
 // WriteDebugInfo write the debug info to Writer
-func (m *Manager) WriteDebugInfo(w io.Writer) {
-	timeout := time.Second * 3
-	done := m.sendCommand(commandTpWriteDebugInfo, w)
-	// wait the debug info printed
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		fmt.Fprintf(w, "failed to print debug info for processor\n")
+func (m *managerImpl) WriteDebugInfo(
+	ctx context.Context, w io.Writer, done chan<- error,
+) {
+	err := m.sendCommand(ctx, commandTpWriteDebugInfo, w, done)
+	if err != nil {
+		log.Warn("send command commandTpWriteDebugInfo failed", zap.Error(err))
 	}
 }
 
-func (m *Manager) sendCommand(tp commandTp, payload interface{}) chan struct{} {
-	timeout := time.Second * 3
-	cmd := &command{tp: tp, payload: payload, done: make(chan struct{})}
+// sendCommands sends command to manager.
+// `done` is closed upon command completion or sendCommand returns error.
+func (m *managerImpl) sendCommand(
+	ctx context.Context, tp commandTp, payload interface{}, done chan<- error,
+) error {
+	cmd := &command{tp: tp, payload: payload, done: done}
 	select {
+	case <-ctx.Done():
+		close(done)
+		return errors.Trace(ctx.Err())
 	case m.commandQueue <- cmd:
-	case <-time.After(timeout):
-		close(cmd.done)
-		log.Warn("the command queue is full, ignore this command", zap.Any("command", cmd))
-	}
-	return cmd.done
-}
-
-func (m *Manager) handleCommand() error {
-	var cmd *command
-	select {
-	case cmd = <-m.commandQueue:
-	default:
-		return nil
-	}
-	defer close(cmd.done)
-	switch cmd.tp {
-	case commandTpClose:
-		for changefeedID := range m.processors {
-			m.closeProcessor(changefeedID)
-		}
-		return cerrors.ErrReactorFinished
-	case commandTpWriteDebugInfo:
-		w := cmd.payload.(io.Writer)
-		m.writeDebugInfo(w)
-	default:
-		log.Warn("Unknown command in processor manager", zap.Any("command", cmd))
+		// FIXME: signal EtcdWorker to handle commands ASAP.
 	}
 	return nil
 }
 
-func (m *Manager) writeDebugInfo(w io.Writer) {
+func (m *managerImpl) handleCommand() {
+	var cmd *command
+	select {
+	case cmd = <-m.commandQueue:
+	default:
+		return
+	}
+	defer close(cmd.done)
+	switch cmd.tp {
+	case commandTpWriteDebugInfo:
+		w := cmd.payload.(io.Writer)
+		err := m.writeDebugInfo(w)
+		if err != nil {
+			cmd.done <- err
+		}
+	default:
+		log.Warn("Unknown command in processor manager", zap.Any("command", cmd))
+	}
+}
+
+func (m *managerImpl) writeDebugInfo(w io.Writer) error {
 	for changefeedID, processor := range m.processors {
 		fmt.Fprintf(w, "changefeedID: %s\n", changefeedID)
-		processor.WriteDebugInfo(w)
+		err := processor.WriteDebugInfo(w)
+		if err != nil {
+			return errors.Trace(err)
+		}
 		fmt.Fprintf(w, "\n")
 	}
+
+	return nil
 }
