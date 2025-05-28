@@ -35,14 +35,14 @@ var (
 			Name:      "event_feed_count",
 			Help:      "The number of event feed running",
 		})
-	scanRegionsDuration = prometheus.NewHistogramVec(
+	scanRegionsDuration = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: "ticdc",
 			Subsystem: "kvclient",
 			Name:      "scan_regions_duration_seconds",
 			Help:      "The time it took to finish a scanRegions call.",
 			Buckets:   prometheus.ExponentialBuckets(0.001 /* 1 ms */, 2, 18),
-		}, []string{"capture"})
+		})
 	eventSize = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "ticdc",
@@ -50,35 +50,42 @@ var (
 			Name:      "event_size_bytes",
 			Help:      "Size of KV events.",
 			Buckets:   prometheus.ExponentialBuckets(16, 2, 25),
-		}, []string{"capture"})
+		}, []string{"type"})
 	pullEventCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "ticdc",
 			Subsystem: "kvclient",
 			Name:      "pull_event_count",
 			Help:      "event count received by this puller",
-		}, []string{"type", "capture", "changefeed"})
+		}, []string{"type", "namespace", "changefeed"})
 	sendEventCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "ticdc",
 			Subsystem: "kvclient",
 			Name:      "send_event_count",
 			Help:      "event count sent to event channel by this puller",
-		}, []string{"type", "capture", "changefeed"})
+		}, []string{"type", "namespace", "changefeed"})
 	clientChannelSize = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
 			Subsystem: "kvclient",
 			Name:      "channel_size",
 			Help:      "size of each channel in kv client",
-		}, []string{"id", "channel"})
+		}, []string{"namespace", "changefeed", "table", "type"})
 	clientRegionTokenSize = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
 			Subsystem: "kvclient",
 			Name:      "region_token",
 			Help:      "size of region token in kv client",
-		}, []string{"store", "table", "changefeed"})
+		}, []string{"store", "namespace", "changefeed"})
+	cachedRegionSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "cached_region",
+			Help:      "cached region that has not requested to TiKV in kv client",
+		}, []string{"store", "namespace", "changefeed"})
 	batchResolvedEventSize = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "ticdc",
@@ -86,15 +93,84 @@ var (
 			Name:      "batch_resolved_event_size",
 			Help:      "The number of region in one batch resolved ts event",
 			Buckets:   prometheus.ExponentialBuckets(2, 2, 16),
-		}, []string{"capture", "changefeed"})
-	etcdRequestCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+		}, []string{"namespace", "changefeed"})
+	grpcPoolStreamGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
 			Namespace: "ticdc",
-			Subsystem: "etcd",
-			Name:      "request_count",
-			Help:      "request counter of etcd operation",
-		}, []string{"type", "capture"})
+			Subsystem: "kvclient",
+			Name:      "grpc_stream_count",
+			Help:      "active stream count of each gRPC connection",
+		}, []string{"store"})
+
+	regionEventsBatchSize = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "region_events_batch_size",
+			Help:      "region events batch size",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 20),
+		})
+
+	regionConnectDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "region_connect_duration",
+			Help:      "time of locating a region in ms",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 20),
+		},
+		// actions: lock, locate, connect.
+		[]string{"namespace", "changefeed", "action"})
+
+	lockResolveDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "lock_resolve_duration",
+			Help:      "time of lock resolve in ms",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 20),
+		},
+		// actions: wait, run.
+		[]string{"namespace", "changefeed", "action"})
+
+	regionWorkerQueueDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "region_worker_queue_duration",
+			Help:      "time of queue in region worker",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 20),
+		},
+		// actions: wait, run.
+		[]string{"namespace", "changefeed"})
+
+	workerBusyRatio = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "region_worker_busy_ratio",
+			Help:      "Busy ratio for region worker.",
+		}, []string{"namespace", "changefeed", "table", "store", "type"})
+	workerChannelSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "region_worker_channel_size",
+			Help:      "size of each channel in region worker",
+		}, []string{"namespace", "changefeed", "table", "store", "type"})
+	slowInitializeRegion = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "kvclient",
+			Name:      "slow_initialize_region_count",
+			Help:      "the number of slow initialize region",
+		}, []string{"namespace", "changefeed"})
 )
+
+// GetGlobalGrpcMetrics gets the global grpc metrics.
+func GetGlobalGrpcMetrics() *grpc_prometheus.ClientMetrics {
+	return grpcMetrics
+}
 
 // InitMetrics registers all metrics in the kv package
 func InitMetrics(registry *prometheus.Registry) {
@@ -106,8 +182,16 @@ func InitMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(sendEventCounter)
 	registry.MustRegister(clientChannelSize)
 	registry.MustRegister(clientRegionTokenSize)
+	registry.MustRegister(cachedRegionSize)
 	registry.MustRegister(batchResolvedEventSize)
-	registry.MustRegister(etcdRequestCounter)
+	registry.MustRegister(grpcPoolStreamGauge)
+	registry.MustRegister(regionEventsBatchSize)
+	registry.MustRegister(regionConnectDuration)
+	registry.MustRegister(lockResolveDuration)
+	registry.MustRegister(regionWorkerQueueDuration)
+	registry.MustRegister(workerBusyRatio)
+	registry.MustRegister(workerChannelSize)
+	registry.MustRegister(slowInitializeRegion)
 
 	// Register client metrics to registry.
 	registry.MustRegister(grpcMetrics)
