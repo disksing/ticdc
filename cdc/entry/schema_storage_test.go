@@ -15,36 +15,39 @@ package entry
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"sort"
+	"testing"
+	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/pingcap/check"
 	"github.com/pingcap/errors"
-	timodel "github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/ticdc/cdc/kv"
-	"github.com/pingcap/ticdc/cdc/model"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
-	ticonfig "github.com/pingcap/tidb/config"
-	"github.com/pingcap/tidb/domain"
-	tidbkv "github.com/pingcap/tidb/kv"
-	timeta "github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/session"
-	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/store/mockstore"
-	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/testkit"
+	"github.com/pingcap/log"
+	ticonfig "github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/ddl"
+	"github.com/pingcap/tidb/pkg/domain"
+	tidbkv "github.com/pingcap/tidb/pkg/kv"
+	timeta "github.com/pingcap/tidb/pkg/meta"
+	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	pmodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/session"
+	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
+	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tiflow/cdc/entry/schema"
+	"github.com/pingcap/tiflow/cdc/kv"
+	"github.com/pingcap/tiflow/cdc/model"
+	"github.com/pingcap/tiflow/pkg/config"
+	"github.com/pingcap/tiflow/pkg/filter"
+	"github.com/pingcap/tiflow/pkg/util"
+	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/oracle"
+	"go.uber.org/zap"
 )
 
-type schemaSuite struct{}
-
-var _ = check.Suite(&schemaSuite{})
-
-func (t *schemaSuite) TestSchema(c *check.C) {
-	defer testleak.AfterTest(c)()
-	dbName := timodel.NewCIStr("Test")
+func TestSchema(t *testing.T) {
+	dbName := pmodel.NewCIStr("Test")
 	// db and ignoreDB info
 	dbInfo := &timodel.DBInfo{
 		ID:    1,
@@ -54,70 +57,68 @@ func (t *schemaSuite) TestSchema(c *check.C) {
 	// `createSchema` job1
 	job := &timodel.Job{
 		ID:         3,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   1,
 		Type:       timodel.ActionCreateSchema,
 		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 1, DBInfo: dbInfo, FinishedTS: 123},
 		Query:      "create database test",
 	}
 	// reconstruct the local schema
-	snap := newEmptySchemaSnapshot(false)
-	err := snap.handleDDL(job)
-	c.Assert(err, check.IsNil)
+	snap := schema.NewEmptySnapshot(false)
+	err := snap.HandleDDL(job)
+	require.Nil(t, err)
 	_, exist := snap.SchemaByID(job.SchemaID)
-	c.Assert(exist, check.IsTrue)
+	require.True(t, exist)
 
 	// test drop schema
 	job = &timodel.Job{
 		ID:         6,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   1,
 		Type:       timodel.ActionDropSchema,
 		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 3, DBInfo: dbInfo, FinishedTS: 124},
 		Query:      "drop database test",
 	}
-	err = snap.handleDDL(job)
-	c.Assert(err, check.IsNil)
+	err = snap.HandleDDL(job)
+	require.Nil(t, err)
 	_, exist = snap.SchemaByID(job.SchemaID)
-	c.Assert(exist, check.IsFalse)
+	require.False(t, exist)
 
 	job = &timodel.Job{
 		ID:         3,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   1,
 		Type:       timodel.ActionCreateSchema,
 		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 2, DBInfo: dbInfo, FinishedTS: 124},
 		Query:      "create database test",
 	}
 
-	err = snap.handleDDL(job)
-	c.Assert(err, check.IsNil)
-	err = snap.handleDDL(job)
-	c.Log(err)
-	c.Assert(errors.IsAlreadyExists(err), check.IsTrue)
+	err = snap.HandleDDL(job)
+	require.Nil(t, err)
+	err = snap.HandleDDL(job)
+	require.True(t, errors.IsAlreadyExists(err))
 
 	// test schema drop schema error
 	job = &timodel.Job{
 		ID:         9,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   1,
 		Type:       timodel.ActionDropSchema,
 		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 1, DBInfo: dbInfo, FinishedTS: 123},
 		Query:      "drop database test",
 	}
-	err = snap.handleDDL(job)
-	c.Assert(err, check.IsNil)
-	err = snap.handleDDL(job)
-	c.Assert(errors.IsNotFound(err), check.IsTrue)
+	err = snap.HandleDDL(job)
+	require.Nil(t, err)
+	err = snap.HandleDDL(job)
+	require.True(t, errors.IsNotFound(err))
 }
 
-func (*schemaSuite) TestTable(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestTable(t *testing.T) {
 	var jobs []*timodel.Job
-	dbName := timodel.NewCIStr("Test")
-	tbName := timodel.NewCIStr("T")
-	colName := timodel.NewCIStr("A")
-	idxName := timodel.NewCIStr("idx")
+	dbName := pmodel.NewCIStr("Test")
+	tbName := pmodel.NewCIStr("T")
+	colName := pmodel.NewCIStr("A")
+	idxName := pmodel.NewCIStr("idx")
 	// column info
 	colInfo := &timodel.ColumnInfo{
 		ID:        1,
@@ -137,8 +138,8 @@ func (*schemaSuite) TestTable(c *check.C) {
 				Length: 10,
 			},
 		},
-		Unique:  true,
-		Primary: true,
+		Unique:  false,
+		Primary: false,
 		State:   timodel.StatePublic,
 	}
 	// table info
@@ -157,7 +158,7 @@ func (*schemaSuite) TestTable(c *check.C) {
 	// `createSchema` job
 	job := &timodel.Job{
 		ID:         5,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   3,
 		Type:       timodel.ActionCreateSchema,
 		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 1, DBInfo: dbInfo, FinishedTS: 123},
@@ -168,7 +169,7 @@ func (*schemaSuite) TestTable(c *check.C) {
 	// `createTable` job
 	job = &timodel.Job{
 		ID:         6,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   3,
 		TableID:    2,
 		Type:       timodel.ActionCreateTable,
@@ -181,7 +182,7 @@ func (*schemaSuite) TestTable(c *check.C) {
 	tblInfo.Columns = []*timodel.ColumnInfo{colInfo}
 	job = &timodel.Job{
 		ID:         7,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   3,
 		TableID:    2,
 		Type:       timodel.ActionAddColumn,
@@ -195,7 +196,7 @@ func (*schemaSuite) TestTable(c *check.C) {
 	tblInfo.Indices = []*timodel.IndexInfo{idxInfo}
 	job = &timodel.Job{
 		ID:         8,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   3,
 		TableID:    2,
 		Type:       timodel.ActionAddIndex,
@@ -205,23 +206,23 @@ func (*schemaSuite) TestTable(c *check.C) {
 	jobs = append(jobs, job)
 
 	// reconstruct the local schema
-	snap := newEmptySchemaSnapshot(false)
+	snap := schema.NewEmptySnapshot(false)
 	for _, job := range jobs {
-		err := snap.handleDDL(job)
-		c.Assert(err, check.IsNil)
+		err := snap.HandleDDL(job)
+		require.Nil(t, err)
 	}
 
 	// check the historical db that constructed above whether in the schema list of local schema
 	_, ok := snap.SchemaByID(dbInfo.ID)
-	c.Assert(ok, check.IsTrue)
+	require.True(t, ok)
 	// check the historical table that constructed above whether in the table list of local schema
-	table, ok := snap.TableByID(tblInfo.ID)
-	c.Assert(ok, check.IsTrue)
-	c.Assert(table.Columns, check.HasLen, 1)
-	c.Assert(table.Indices, check.HasLen, 1)
+	table, ok := snap.PhysicalTableByID(tblInfo.ID)
+	require.True(t, ok)
+	require.Len(t, table.Columns, 1)
+	require.Len(t, table.Indices, 1)
 
 	// test ineligible tables
-	c.Assert(snap.IsIneligibleTableID(2), check.IsTrue)
+	require.True(t, snap.IsIneligibleTableID(2))
 
 	// check truncate table
 	tblInfo1 := &timodel.TableInfo{
@@ -231,7 +232,7 @@ func (*schemaSuite) TestTable(c *check.C) {
 	}
 	job = &timodel.Job{
 		ID:         9,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   3,
 		TableID:    2,
 		Type:       timodel.ActionTruncateTable,
@@ -239,26 +240,26 @@ func (*schemaSuite) TestTable(c *check.C) {
 		Query:      "truncate table " + tbName.O,
 	}
 	preTableInfo, err := snap.PreTableInfo(job)
-	c.Assert(err, check.IsNil)
-	c.Assert(preTableInfo.TableName, check.Equals, model.TableName{Schema: "Test", Table: "T"})
-	c.Assert(preTableInfo.ID, check.Equals, int64(2))
+	require.Nil(t, err)
+	require.Equal(t, preTableInfo.TableName, model.TableName{Schema: "Test", Table: "T", TableID: 2})
+	require.Equal(t, preTableInfo.ID, int64(2))
 
-	err = snap.handleDDL(job)
-	c.Assert(err, check.IsNil)
+	err = snap.HandleDDL(job)
+	require.Nil(t, err)
 
-	_, ok = snap.TableByID(tblInfo1.ID)
-	c.Assert(ok, check.IsTrue)
+	_, ok = snap.PhysicalTableByID(tblInfo1.ID)
+	require.True(t, ok)
 
-	_, ok = snap.TableByID(2)
-	c.Assert(ok, check.IsFalse)
+	_, ok = snap.PhysicalTableByID(2)
+	require.False(t, ok)
 
 	// test ineligible tables
-	c.Assert(snap.IsIneligibleTableID(9), check.IsTrue)
-	c.Assert(snap.IsIneligibleTableID(2), check.IsFalse)
+	require.True(t, snap.IsIneligibleTableID(9))
+	require.False(t, snap.IsIneligibleTableID(2))
 	// check drop table
 	job = &timodel.Job{
 		ID:         9,
-		State:      timodel.JobStateSynced,
+		State:      timodel.JobStateDone,
 		SchemaID:   3,
 		TableID:    9,
 		Type:       timodel.ActionDropTable,
@@ -266,32 +267,38 @@ func (*schemaSuite) TestTable(c *check.C) {
 		Query:      "drop table " + tbName.O,
 	}
 	preTableInfo, err = snap.PreTableInfo(job)
-	c.Assert(err, check.IsNil)
-	c.Assert(preTableInfo.TableName, check.Equals, model.TableName{Schema: "Test", Table: "T"})
-	c.Assert(preTableInfo.ID, check.Equals, int64(9))
+	require.Nil(t, err)
+	require.Equal(t, preTableInfo.TableName, model.TableName{Schema: "Test", Table: "T", TableID: 9})
+	require.Equal(t, preTableInfo.ID, int64(9))
 
-	err = snap.handleDDL(job)
-	c.Assert(err, check.IsNil)
+	err = snap.HandleDDL(job)
+	require.Nil(t, err)
 
-	_, ok = snap.TableByID(tblInfo.ID)
-	c.Assert(ok, check.IsFalse)
+	_, ok = snap.PhysicalTableByID(tblInfo.ID)
+	require.False(t, ok)
 
 	// test ineligible tables
-	c.Assert(snap.IsIneligibleTableID(9), check.IsFalse)
+	require.False(t, snap.IsIneligibleTableID(9))
 
 	// drop schema
-	err = snap.dropSchema(3)
-	c.Assert(err, check.IsNil)
+	job = &timodel.Job{
+		ID:         10,
+		State:      timodel.JobStateDone,
+		SchemaID:   3,
+		Type:       timodel.ActionDropSchema,
+		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 7, FinishedTS: 129},
+		Query:      "drop table " + dbName.O,
+	}
+	err = snap.DoHandleDDL(job)
+	require.Nil(t, err)
 }
 
-func (t *schemaSuite) TestHandleDDL(c *check.C) {
-	defer testleak.AfterTest(c)()
-
-	snap := newEmptySchemaSnapshot(false)
-	dbName := timodel.NewCIStr("Test")
-	colName := timodel.NewCIStr("A")
-	tbName := timodel.NewCIStr("T")
-	newTbName := timodel.NewCIStr("RT")
+func TestHandleDDL(t *testing.T) {
+	snap := schema.NewEmptySnapshot(false)
+	dbName := pmodel.NewCIStr("Test")
+	colName := pmodel.NewCIStr("A")
+	tbName := pmodel.NewCIStr("T")
+	newTbName := pmodel.NewCIStr("RT")
 
 	// db info
 	dbInfo := &timodel.DBInfo{
@@ -358,148 +365,144 @@ func (t *schemaSuite) TestHandleDDL(c *check.C) {
 			BinlogInfo: testCase.binlogInfo,
 			Query:      testCase.query,
 		}
-		testDoDDLAndCheck(c, snap, job, false)
+		testDoDDLAndCheck(t, snap, job, false)
 
 		// custom check after ddl
 		switch testCase.name {
 		case "createSchema":
 			_, ok := snap.SchemaByID(dbInfo.ID)
-			c.Assert(ok, check.IsTrue)
+			require.True(t, ok)
 		case "createTable":
-			_, ok := snap.TableByID(tblInfo.ID)
-			c.Assert(ok, check.IsTrue)
+			_, ok := snap.PhysicalTableByID(tblInfo.ID)
+			require.True(t, ok)
 		case "renameTable":
-			tb, ok := snap.TableByID(tblInfo.ID)
-			c.Assert(ok, check.IsTrue)
-			c.Assert(tblInfo.Name, check.Equals, tb.Name)
+			tb, ok := snap.PhysicalTableByID(tblInfo.ID)
+			require.True(t, ok)
+			require.Equal(t, tblInfo.Name, tb.Name)
 		case "addColumn", "truncateTable":
-			tb, ok := snap.TableByID(tblInfo.ID)
-			c.Assert(ok, check.IsTrue)
-			c.Assert(tb.Columns, check.HasLen, 1)
+			tb, ok := snap.PhysicalTableByID(tblInfo.ID)
+			require.True(t, ok)
+			require.Len(t, tb.Columns, 1)
 		case "dropTable":
-			_, ok := snap.TableByID(tblInfo.ID)
-			c.Assert(ok, check.IsFalse)
+			_, ok := snap.PhysicalTableByID(tblInfo.ID)
+			require.False(t, ok)
 		case "dropSchema":
 			_, ok := snap.SchemaByID(job.SchemaID)
-			c.Assert(ok, check.IsFalse)
+			require.False(t, ok)
 		}
 	}
 }
 
-func testDoDDLAndCheck(c *check.C, snap *schemaSnapshot, job *timodel.Job, isErr bool) {
-	err := snap.handleDDL(job)
-	c.Assert(err != nil, check.Equals, isErr)
-}
-
-type getUniqueKeysSuite struct{}
-
-var _ = check.Suite(&getUniqueKeysSuite{})
-
-func (s *getUniqueKeysSuite) TestPKShouldBeInTheFirstPlaceWhenPKIsNotHandle(c *check.C) {
-	defer testleak.AfterTest(c)()
-	t := timodel.TableInfo{
-		Columns: []*timodel.ColumnInfo{
-			{
-				Name: timodel.CIStr{O: "name"},
-				FieldType: types.FieldType{
-					Flag: mysql.NotNullFlag,
-				},
-			},
-			{Name: timodel.CIStr{O: "id"}},
-		},
-		Indices: []*timodel.IndexInfo{
-			{
-				Name: timodel.CIStr{
-					O: "name",
-				},
-				Columns: []*timodel.IndexColumn{
-					{
-						Name:   timodel.CIStr{O: "name"},
-						Offset: 0,
-					},
-				},
-				Unique: true,
-			},
-			{
-				Name: timodel.CIStr{
-					O: "PRIMARY",
-				},
-				Columns: []*timodel.IndexColumn{
-					{
-						Name:   timodel.CIStr{O: "id"},
-						Offset: 1,
-					},
-				},
-				Primary: true,
-			},
-		},
-		PKIsHandle: false,
+func TestHandleRenameTables(t *testing.T) {
+	// Initial schema: db_1.table_1 and db_2.table_2.
+	snap := schema.NewEmptySnapshot(true)
+	var i int64
+	for i = 1; i < 3; i++ {
+		dbInfo := &timodel.DBInfo{
+			ID:    i,
+			Name:  pmodel.NewCIStr(fmt.Sprintf("db_%d", i)),
+			State: timodel.StatePublic,
+		}
+		job := &timodel.Job{
+			ID:         i,
+			State:      timodel.JobStateDone,
+			SchemaID:   i,
+			Type:       timodel.ActionCreateSchema,
+			BinlogInfo: &timodel.HistoryInfo{SchemaVersion: i, DBInfo: dbInfo, FinishedTS: uint64(i)},
+			Query:      fmt.Sprintf("create database %s", dbInfo.Name.O),
+		}
+		err := snap.HandleDDL(job)
+		require.Nil(t, err)
 	}
-	info := model.WrapTableInfo(1, "", 0, &t)
-	cols := info.GetUniqueKeys()
-	c.Assert(cols, check.DeepEquals, [][]string{
-		{"id"}, {"name"},
-	})
-}
-
-func (s *getUniqueKeysSuite) TestPKShouldBeInTheFirstPlaceWhenPKIsHandle(c *check.C) {
-	defer testleak.AfterTest(c)()
-	t := timodel.TableInfo{
-		Indices: []*timodel.IndexInfo{
-			{
-				Name: timodel.CIStr{
-					O: "uniq_job",
-				},
-				Columns: []*timodel.IndexColumn{
-					{Name: timodel.CIStr{O: "job"}},
-				},
-				Unique: true,
-			},
-		},
-		Columns: []*timodel.ColumnInfo{
-			{
-				Name: timodel.CIStr{
-					O: "job",
-				},
-				FieldType: types.FieldType{
-					Flag: mysql.NotNullFlag,
-				},
-			},
-			{
-				Name: timodel.CIStr{
-					O: "uid",
-				},
-				FieldType: types.FieldType{
-					Flag: mysql.PriKeyFlag,
-				},
-			},
-		},
-		PKIsHandle: true,
+	for i = 1; i < 3; i++ {
+		tblInfo := &timodel.TableInfo{
+			ID:    10 + i,
+			Name:  pmodel.NewCIStr(fmt.Sprintf("table_%d", i)),
+			State: timodel.StatePublic,
+		}
+		job := &timodel.Job{
+			ID:         i,
+			State:      timodel.JobStateDone,
+			SchemaID:   i,
+			TableID:    10 + i,
+			Type:       timodel.ActionCreateTable,
+			BinlogInfo: &timodel.HistoryInfo{SchemaVersion: i, TableInfo: tblInfo, FinishedTS: uint64(10 + i)},
+			Query:      "create table " + tblInfo.Name.O,
+		}
+		err := snap.HandleDDL(job)
+		require.Nil(t, err)
 	}
-	info := model.WrapTableInfo(1, "", 0, &t)
-	cols := info.GetUniqueKeys()
-	c.Assert(cols, check.DeepEquals, [][]string{
-		{"uid"}, {"job"},
-	})
+
+	// rename table db1.table_1 to db2.x, db2.table_2 to db1.y
+	oldSchemaIDs := []int64{1, 2}
+	newSchemaIDs := []int64{2, 1}
+	oldTableIDs := []int64{11, 12}
+	newTableNames := []pmodel.CIStr{pmodel.NewCIStr("x"), pmodel.NewCIStr("y")}
+	oldTableNames := []pmodel.CIStr{pmodel.NewCIStr("oldx"), pmodel.NewCIStr("oldy")}
+	oldSchemaNames := []pmodel.CIStr{pmodel.NewCIStr("db_1"), pmodel.NewCIStr("db_2")}
+	args := []interface{}{oldSchemaIDs, newSchemaIDs, newTableNames, oldTableIDs, oldSchemaNames, oldTableNames}
+	rawArgs, err := json.Marshal(args)
+	require.Nil(t, err)
+	job := &timodel.Job{
+		Version: timodel.JobVersion1,
+		Type:    timodel.ActionRenameTables,
+		RawArgs: rawArgs,
+		BinlogInfo: &timodel.HistoryInfo{
+			FinishedTS: 11112222,
+		},
+	}
+	job.BinlogInfo.MultipleTableInfos = append(job.BinlogInfo.MultipleTableInfos,
+		&timodel.TableInfo{
+			ID:    13,
+			Name:  pmodel.NewCIStr("x"),
+			State: timodel.StatePublic,
+		})
+	job.BinlogInfo.MultipleTableInfos = append(job.BinlogInfo.MultipleTableInfos,
+		&timodel.TableInfo{
+			ID:    14,
+			Name:  pmodel.NewCIStr("y"),
+			State: timodel.StatePublic,
+		})
+	testDoDDLAndCheck(t, snap, job, false)
+
+	var ok bool
+	_, ok = snap.PhysicalTableByID(13)
+	require.True(t, ok)
+	_, ok = snap.PhysicalTableByID(14)
+	require.True(t, ok)
+	_, ok = snap.PhysicalTableByID(11)
+	require.False(t, ok)
+	_, ok = snap.PhysicalTableByID(12)
+	require.False(t, ok)
+
+	n1, _ := snap.TableIDByName("db_2", "x")
+	require.Equal(t, n1, int64(13))
+	n2, _ := snap.TableIDByName("db_1", "y")
+	require.Equal(t, n2, int64(14))
+	require.Equal(t, uint64(11112222), snap.CurrentTs())
 }
 
-func (t *schemaSuite) TestMultiVersionStorage(c *check.C) {
-	defer testleak.AfterTest(c)()
+func testDoDDLAndCheck(t *testing.T, snap *schema.Snapshot, job *timodel.Job, isErr bool) {
+	err := snap.HandleDDL(job)
+	require.Equal(t, err != nil, isErr)
+}
+
+func TestMultiVersionStorage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	dbName := timodel.NewCIStr("Test")
-	tbName := timodel.NewCIStr("T1")
+	dbName := pmodel.NewCIStr("Test")
+	tbName := pmodel.NewCIStr("T1")
 	// db and ignoreDB info
 	dbInfo := &timodel.DBInfo{
-		ID:    1,
+		ID:    11,
 		Name:  dbName,
 		State: timodel.StatePublic,
 	}
 	var jobs []*timodel.Job
 	// `createSchema` job1
 	job := &timodel.Job{
-		ID:         3,
-		State:      timodel.JobStateSynced,
-		SchemaID:   1,
+		ID:         13,
+		State:      timodel.JobStateDone,
+		SchemaID:   11,
 		Type:       timodel.ActionCreateSchema,
 		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 1, DBInfo: dbInfo, FinishedTS: 100},
 		Query:      "create database test",
@@ -508,17 +511,17 @@ func (t *schemaSuite) TestMultiVersionStorage(c *check.C) {
 
 	// table info
 	tblInfo := &timodel.TableInfo{
-		ID:    2,
+		ID:    12,
 		Name:  tbName,
 		State: timodel.StatePublic,
 	}
 
 	// `createTable` job
 	job = &timodel.Job{
-		ID:         6,
-		State:      timodel.JobStateSynced,
-		SchemaID:   1,
-		TableID:    2,
+		ID:         16,
+		State:      timodel.JobStateDone,
+		SchemaID:   11,
+		TableID:    12,
 		Type:       timodel.ActionCreateTable,
 		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 2, TableInfo: tblInfo, FinishedTS: 110},
 		Query:      "create table " + tbName.O,
@@ -526,156 +529,161 @@ func (t *schemaSuite) TestMultiVersionStorage(c *check.C) {
 
 	jobs = append(jobs, job)
 
-	tbName = timodel.NewCIStr("T2")
+	tbName = pmodel.NewCIStr("T2")
 	// table info
 	tblInfo = &timodel.TableInfo{
-		ID:    3,
+		ID:    13,
 		Name:  tbName,
 		State: timodel.StatePublic,
 	}
 	// `createTable` job
 	job = &timodel.Job{
-		ID:         6,
-		State:      timodel.JobStateSynced,
-		SchemaID:   1,
-		TableID:    3,
+		ID:         16,
+		State:      timodel.JobStateDone,
+		SchemaID:   11,
+		TableID:    13,
 		Type:       timodel.ActionCreateTable,
-		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 2, TableInfo: tblInfo, FinishedTS: 120},
+		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 3, TableInfo: tblInfo, FinishedTS: 120},
 		Query:      "create table " + tbName.O,
 	}
 
 	jobs = append(jobs, job)
-	storage, err := NewSchemaStorage(nil, 0, nil, false)
-	c.Assert(err, check.IsNil)
+	f, err := filter.NewFilter(config.GetDefaultReplicaConfig(), "")
+	require.Nil(t, err)
+	storage, err := NewSchemaStorage(nil, 0, false, model.DefaultChangeFeedID("dummy"), util.RoleTester, f)
+	require.Nil(t, err)
 	for _, job := range jobs {
 		err := storage.HandleDDLJob(job)
-		c.Assert(err, check.IsNil)
+		require.Nil(t, err)
 	}
 
 	// `dropTable` job
 	job = &timodel.Job{
-		ID:         6,
-		State:      timodel.JobStateSynced,
-		SchemaID:   1,
-		TableID:    2,
+		ID:         16,
+		State:      timodel.JobStateDone,
+		SchemaID:   11,
+		TableID:    12,
 		Type:       timodel.ActionDropTable,
-		BinlogInfo: &timodel.HistoryInfo{FinishedTS: 130},
+		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 4, FinishedTS: 130},
 	}
 
 	err = storage.HandleDDLJob(job)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 
 	// `dropSchema` job
 	job = &timodel.Job{
-		ID:         6,
-		State:      timodel.JobStateSynced,
-		SchemaID:   1,
+		ID:         16,
+		State:      timodel.JobStateDone,
+		SchemaID:   11,
 		Type:       timodel.ActionDropSchema,
-		BinlogInfo: &timodel.HistoryInfo{FinishedTS: 140, DBInfo: dbInfo},
+		BinlogInfo: &timodel.HistoryInfo{SchemaVersion: 5, FinishedTS: 140, DBInfo: dbInfo},
 	}
 
 	err = storage.HandleDDLJob(job)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 
-	c.Assert(storage.(*schemaStorageImpl).resolvedTs, check.Equals, uint64(140))
+	require.Equal(t, storage.(*schemaStorage).resolvedTs, uint64(140))
 	snap, err := storage.GetSnapshot(ctx, 100)
-	c.Assert(err, check.IsNil)
-	_, exist := snap.SchemaByID(1)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsFalse)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsFalse)
+	require.Nil(t, err)
+	_, exist := snap.SchemaByID(11)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.False(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.False(t, exist)
 
 	snap, err = storage.GetSnapshot(ctx, 115)
-	c.Assert(err, check.IsNil)
-	_, exist = snap.SchemaByID(1)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsFalse)
+	require.Nil(t, err)
+	_, exist = snap.SchemaByID(11)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.False(t, exist)
 
 	snap, err = storage.GetSnapshot(ctx, 125)
-	c.Assert(err, check.IsNil)
-	_, exist = snap.SchemaByID(1)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsTrue)
+	require.Nil(t, err)
+	_, exist = snap.SchemaByID(11)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.True(t, exist)
 
 	snap, err = storage.GetSnapshot(ctx, 135)
-	c.Assert(err, check.IsNil)
-	_, exist = snap.SchemaByID(1)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsFalse)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsTrue)
+	require.Nil(t, err)
+	_, exist = snap.SchemaByID(11)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.False(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.True(t, exist)
 
 	snap, err = storage.GetSnapshot(ctx, 140)
-	c.Assert(err, check.IsNil)
-	_, exist = snap.SchemaByID(1)
-	c.Assert(exist, check.IsFalse)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsFalse)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsFalse)
+	require.Nil(t, err)
+	_, exist = snap.SchemaByID(11)
+	require.False(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.False(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.False(t, exist)
 
-	storage.DoGC(0)
+	lastSchemaTs := storage.DoGC(0)
+	require.Equal(t, uint64(0), lastSchemaTs)
+
 	snap, err = storage.GetSnapshot(ctx, 100)
-	c.Assert(err, check.IsNil)
-	_, exist = snap.SchemaByID(1)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsFalse)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsFalse)
+	require.Nil(t, err)
+	_, exist = snap.SchemaByID(11)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.False(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.False(t, exist)
 	storage.DoGC(115)
 	_, err = storage.GetSnapshot(ctx, 100)
-	c.Assert(err, check.NotNil)
+	require.NotNil(t, err)
 	snap, err = storage.GetSnapshot(ctx, 115)
-	c.Assert(err, check.IsNil)
-	_, exist = snap.SchemaByID(1)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsTrue)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsFalse)
+	require.Nil(t, err)
+	_, exist = snap.SchemaByID(11)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.True(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.False(t, exist)
 
-	storage.DoGC(155)
+	lastSchemaTs = storage.DoGC(155)
+	require.Equal(t, uint64(140), lastSchemaTs)
+
 	storage.AdvanceResolvedTs(185)
 
 	snap, err = storage.GetSnapshot(ctx, 180)
-	c.Assert(err, check.IsNil)
-	_, exist = snap.SchemaByID(1)
-	c.Assert(exist, check.IsFalse)
-	_, exist = snap.TableByID(2)
-	c.Assert(exist, check.IsFalse)
-	_, exist = snap.TableByID(3)
-	c.Assert(exist, check.IsFalse)
+	require.Nil(t, err)
+	_, exist = snap.SchemaByID(11)
+	require.False(t, exist)
+	_, exist = snap.PhysicalTableByID(12)
+	require.False(t, exist)
+	_, exist = snap.PhysicalTableByID(13)
+	require.False(t, exist)
 	_, err = storage.GetSnapshot(ctx, 130)
-	c.Assert(err, check.NotNil)
+	require.NotNil(t, err)
 
 	cancel()
 	_, err = storage.GetSnapshot(ctx, 200)
-	c.Assert(errors.Cause(err), check.Equals, context.Canceled)
+	require.Equal(t, errors.Cause(err), context.Canceled)
 }
 
-func (t *schemaSuite) TestCreateSnapFromMeta(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestCreateSnapFromMeta(t *testing.T) {
 	store, err := mockstore.NewMockStore()
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 	defer store.Close() //nolint:errcheck
 
-	session.SetSchemaLease(0)
+	session.SetSchemaLease(time.Second)
 	session.DisableStats4Test()
 	domain, err := session.BootstrapSession(store)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 	defer domain.Close()
 	domain.SetStatsUpdating(true)
-	tk := testkit.NewTestKit(c, store)
+	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("create database test2")
 	tk.MustExec("create table test.simple_test1 (id bigint primary key)")
 	tk.MustExec("create table test.simple_test2 (id bigint primary key)")
@@ -683,79 +691,36 @@ func (t *schemaSuite) TestCreateSnapFromMeta(c *check.C) {
 	tk.MustExec("create table test2.simple_test4 (id bigint primary key)")
 	tk.MustExec("create table test2.simple_test5 (a bigint)")
 	ver, err := store.CurrentVersion(oracle.GlobalTxnScope)
-	c.Assert(err, check.IsNil)
-	meta, err := kv.GetSnapshotMeta(store, ver.Ver)
-	c.Assert(err, check.IsNil)
-	snap, err := newSchemaSnapshotFromMeta(meta, ver.Ver, false)
-	c.Assert(err, check.IsNil)
-	_, ok := snap.GetTableByName("test", "simple_test1")
-	c.Assert(ok, check.IsTrue)
-	tableID, ok := snap.GetTableIDByName("test2", "simple_test5")
-	c.Assert(ok, check.IsTrue)
-	c.Assert(snap.IsIneligibleTableID(tableID), check.IsTrue)
+	require.Nil(t, err)
+	meta := kv.GetSnapshotMeta(store, ver.Ver)
+	f, err := filter.NewFilter(config.GetDefaultReplicaConfig(), "")
+	require.Nil(t, err)
+	snap, err := schema.NewSnapshotFromMeta(model.DefaultChangeFeedID("test"), meta, ver.Ver, false, f)
+	require.Nil(t, err)
+	_, ok := snap.TableByName("test", "simple_test1")
+	require.True(t, ok)
+	tableID, ok := snap.TableIDByName("test2", "simple_test5")
+	require.True(t, ok)
+	require.True(t, snap.IsIneligibleTableID(tableID))
 	dbInfo, ok := snap.SchemaByTableID(tableID)
-	c.Assert(ok, check.IsTrue)
-	c.Assert(dbInfo.Name.O, check.Equals, "test2")
-	c.Assert(len(snap.tableInSchema), check.Equals, 3)
+	require.True(t, ok)
+	require.Equal(t, dbInfo.Name.O, "test2")
 }
 
-func (t *schemaSuite) TestSnapshotClone(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestExplicitTables(t *testing.T) {
 	store, err := mockstore.NewMockStore()
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 	defer store.Close() //nolint:errcheck
 
-	session.SetSchemaLease(0)
+	session.SetSchemaLease(time.Second)
 	session.DisableStats4Test()
 	domain, err := session.BootstrapSession(store)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 	defer domain.Close()
 	domain.SetStatsUpdating(true)
-	tk := testkit.NewTestKit(c, store)
-	tk.MustExec("create database test2")
-	tk.MustExec("create table test.simple_test1 (id bigint primary key)")
-	tk.MustExec("create table test.simple_test2 (id bigint primary key)")
-	tk.MustExec("create table test2.simple_test3 (id bigint primary key)")
-	tk.MustExec("create table test2.simple_test4 (id bigint primary key)")
-	tk.MustExec("create table test2.simple_test5 (a bigint)")
-	ver, err := store.CurrentVersion(oracle.GlobalTxnScope)
-	c.Assert(err, check.IsNil)
-	meta, err := kv.GetSnapshotMeta(store, ver.Ver)
-	c.Assert(err, check.IsNil)
-	snap, err := newSchemaSnapshotFromMeta(meta, ver.Ver, false /* explicitTables */)
-	c.Assert(err, check.IsNil)
-
-	clone := snap.Clone()
-	c.Assert(clone.tableNameToID, check.DeepEquals, snap.tableNameToID)
-	c.Assert(clone.schemaNameToID, check.DeepEquals, snap.schemaNameToID)
-	c.Assert(clone.truncateTableID, check.DeepEquals, snap.truncateTableID)
-	c.Assert(clone.ineligibleTableID, check.DeepEquals, snap.ineligibleTableID)
-	c.Assert(clone.currentTs, check.Equals, snap.currentTs)
-	c.Assert(clone.explicitTables, check.Equals, snap.explicitTables)
-	c.Assert(len(clone.tables), check.Equals, len(snap.tables))
-	c.Assert(len(clone.schemas), check.Equals, len(snap.schemas))
-	c.Assert(len(clone.partitionTable), check.Equals, len(snap.partitionTable))
-
-	tableCount := len(snap.tables)
-	clone.tables = make(map[int64]*model.TableInfo)
-	c.Assert(len(snap.tables), check.Equals, tableCount)
-}
-
-func (t *schemaSuite) TestExplicitTables(c *check.C) {
-	defer testleak.AfterTest(c)()
-	store, err := mockstore.NewMockStore()
-	c.Assert(err, check.IsNil)
-	defer store.Close() //nolint:errcheck
-
-	session.SetSchemaLease(0)
-	session.DisableStats4Test()
-	domain, err := session.BootstrapSession(store)
-	c.Assert(err, check.IsNil)
-	defer domain.Close()
-	domain.SetStatsUpdating(true)
-	tk := testkit.NewTestKit(c, store)
+	tk := testkit.NewTestKit(t, store)
 	ver1, err := store.CurrentVersion(oracle.GlobalTxnScope)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 	tk.MustExec("create database test2")
 	tk.MustExec("create table test.simple_test1 (id bigint primary key)")
 	tk.MustExec("create table test.simple_test2 (id bigint unique key)")
@@ -763,24 +728,33 @@ func (t *schemaSuite) TestExplicitTables(c *check.C) {
 	tk.MustExec("create table test2.simple_test4 (a varchar(20) unique key)")
 	tk.MustExec("create table test2.simple_test5 (a varchar(20))")
 	ver2, err := store.CurrentVersion(oracle.GlobalTxnScope)
-	c.Assert(err, check.IsNil)
-	meta1, err := kv.GetSnapshotMeta(store, ver1.Ver)
-	c.Assert(err, check.IsNil)
-	snap1, err := newSchemaSnapshotFromMeta(meta1, ver1.Ver, true /* explicitTables */)
-	c.Assert(err, check.IsNil)
-	meta2, err := kv.GetSnapshotMeta(store, ver2.Ver)
-	c.Assert(err, check.IsNil)
-	snap2, err := newSchemaSnapshotFromMeta(meta2, ver2.Ver, false /* explicitTables */)
-	c.Assert(err, check.IsNil)
-	snap3, err := newSchemaSnapshotFromMeta(meta2, ver2.Ver, true /* explicitTables */)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
+	meta1 := kv.GetSnapshotMeta(store, ver1.Ver)
+	f, err := filter.NewFilter(config.GetDefaultReplicaConfig(), "")
+	require.Nil(t, err)
+	snap1, err := schema.NewSnapshotFromMeta(model.DefaultChangeFeedID("test"), meta1, ver1.Ver, true /* forceReplicate */, f)
+	require.Nil(t, err)
+	meta2 := kv.GetSnapshotMeta(store, ver2.Ver)
+	snap2, err := schema.NewSnapshotFromMeta(model.DefaultChangeFeedID("test"), meta2, ver2.Ver, false /* forceReplicate */, f)
+	require.Nil(t, err)
+	snap3, err := schema.NewSnapshotFromMeta(model.DefaultChangeFeedID("test"), meta2, ver2.Ver, true /* forceReplicate */, f)
+	require.Nil(t, err)
 
-	c.Assert(len(snap2.tables)-len(snap1.tables), check.Equals, 5)
-	// some system tables are also ineligible
-	c.Assert(len(snap2.ineligibleTableID), check.GreaterEqual, 4)
+	// we don't need to count system tables since TiCDC
+	// don't replicate them and TiDB change them frequently,
+	// so we don't need to consider them in the table count
+	systemTablesFilter := func(dbName, tableName string) bool {
+		return dbName != "mysql" && dbName != "information_schema"
+	}
+	require.Equal(t, 5, snap2.TableCount(true,
+		systemTablesFilter)-snap1.TableCount(true, systemTablesFilter))
+	// only test simple_test1 included
+	require.Equal(t, 1, snap2.TableCount(false, systemTablesFilter))
 
-	c.Assert(len(snap3.tables)-len(snap1.tables), check.Equals, 5)
-	c.Assert(snap3.ineligibleTableID, check.HasLen, 0)
+	require.Equal(t, 5, snap3.TableCount(true,
+		systemTablesFilter)-snap1.TableCount(true, systemTablesFilter))
+	// since we create a snapshot from meta2 and forceReplicate is true, so all tables are included
+	require.Equal(t, 5, snap3.TableCount(false, systemTablesFilter))
 }
 
 /*
@@ -808,36 +782,35 @@ ActionAlterTableAlterPartition      ActionType = 46
 
 ... Any Action which of value is greater than 46 ...
 */
-func (t *schemaSuite) TestSchemaStorage(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestSchemaStorage(t *testing.T) {
 	ctx := context.Background()
 	testCases := [][]string{{
-		"create database test_ddl1",                                                               // ActionCreateSchema
-		"create table test_ddl1.simple_test1 (id bigint primary key)",                             // ActionCreateTable
-		"create table test_ddl1.simple_test2 (id bigint)",                                         // ActionCreateTable
-		"create table test_ddl1.simple_test3 (id bigint primary key)",                             // ActionCreateTable
-		"create table test_ddl1.simple_test4 (id bigint primary key)",                             // ActionCreateTable
-		"DROP TABLE test_ddl1.simple_test3",                                                       // ActionDropTable
-		"ALTER TABLE test_ddl1.simple_test1 ADD COLUMN c1 INT NOT NULL",                           // ActionAddColumn
-		"ALTER TABLE test_ddl1.simple_test1 ADD c2 INT NOT NULL AFTER id",                         // ActionAddColumn
-		"ALTER TABLE test_ddl1.simple_test1 ADD c3 INT NOT NULL, ADD c4 INT NOT NULL",             // ActionAddColumns
-		"ALTER TABLE test_ddl1.simple_test1 DROP c1",                                              // ActionDropColumn
-		"ALTER TABLE test_ddl1.simple_test1 DROP c2, DROP c3",                                     // ActionDropColumns
-		"ALTER TABLE test_ddl1.simple_test1 ADD INDEX (c4)",                                       // ActionAddIndex
-		"ALTER TABLE test_ddl1.simple_test1 DROP INDEX c4",                                        // ActionDropIndex
-		"TRUNCATE test_ddl1.simple_test1",                                                         // ActionTruncateTable
-		"ALTER DATABASE test_ddl1 CHARACTER SET = binary COLLATE binary",                          // ActionModifySchemaCharsetAndCollate
-		"ALTER TABLE test_ddl1.simple_test2 ADD c1 INT NOT NULL, ADD c2 INT NOT NULL",             // ActionAddColumns
-		"ALTER TABLE test_ddl1.simple_test2 ADD INDEX (c1)",                                       // ActionAddIndex
-		"ALTER TABLE test_ddl1.simple_test2 ALTER INDEX c1 INVISIBLE",                             // ActionAlterIndexVisibility
-		"ALTER TABLE test_ddl1.simple_test2 RENAME INDEX c1 TO idx_c1",                            // ActionRenameIndex
-		"ALTER TABLE test_ddl1.simple_test2 MODIFY c2 BIGINT",                                     // ActionModifyColumn
-		"CREATE VIEW test_ddl1.view_test2 AS SELECT * FROM test_ddl1.simple_test2 WHERE id > 2",   // ActionCreateView
-		"DROP VIEW test_ddl1.view_test2",                                                          // ActionDropView
-		"RENAME TABLE test_ddl1.simple_test2 TO test_ddl1.simple_test5",                           // ActionRenameTable
-		"DROP DATABASE test_ddl1",                                                                 // ActionDropSchema
-		"create database test_ddl2",                                                               // ActionCreateSchema
-		"create table test_ddl2.simple_test1 (id bigint primary key, c1 int not null unique key)", // ActionCreateTable
+		"create database test_ddl1",                                                                            // ActionCreateSchema
+		"create table test_ddl1.simple_test1 (id bigint primary key)",                                          // ActionCreateTable
+		"create table test_ddl1.simple_test2 (id bigint)",                                                      // ActionCreateTable
+		"create table test_ddl1.simple_test3 (id bigint primary key)",                                          // ActionCreateTable
+		"create table test_ddl1.simple_test4 (id bigint primary key)",                                          // ActionCreateTable
+		"DROP TABLE test_ddl1.simple_test3",                                                                    // ActionDropTable
+		"ALTER TABLE test_ddl1.simple_test1 ADD COLUMN c1 INT NOT NULL",                                        // ActionAddColumn
+		"ALTER TABLE test_ddl1.simple_test1 ADD c2 INT NOT NULL AFTER id",                                      // ActionAddColumn
+		"ALTER TABLE test_ddl1.simple_test1 ADD c3 INT NOT NULL, ADD c4 INT NOT NULL",                          // ActionAddColumns
+		"ALTER TABLE test_ddl1.simple_test1 DROP c1",                                                           // ActionDropColumn
+		"ALTER TABLE test_ddl1.simple_test1 DROP c2, DROP c3",                                                  // ActionDropColumns
+		"ALTER TABLE test_ddl1.simple_test1 ADD INDEX (c4)",                                                    // ActionAddIndex
+		"ALTER TABLE test_ddl1.simple_test1 DROP INDEX c4",                                                     // ActionDropIndex
+		"TRUNCATE test_ddl1.simple_test1",                                                                      // ActionTruncateTable
+		"ALTER DATABASE test_ddl1 CHARACTER SET = binary COLLATE binary",                                       // ActionModifySchemaCharsetAndCollate
+		"ALTER TABLE test_ddl1.simple_test2 ADD c1 INT NOT NULL, ADD c2 INT NOT NULL",                          // ActionAddColumns
+		"ALTER TABLE test_ddl1.simple_test2 ADD INDEX (c1)",                                                    // ActionAddIndex
+		"ALTER TABLE test_ddl1.simple_test2 ALTER INDEX c1 INVISIBLE",                                          // ActionAlterIndexVisibility
+		"ALTER TABLE test_ddl1.simple_test2 RENAME INDEX c1 TO idx_c1",                                         // ActionRenameIndex
+		"ALTER TABLE test_ddl1.simple_test2 MODIFY c2 BIGINT",                                                  // ActionModifyColumn
+		"CREATE VIEW test_ddl1.view_test2 AS SELECT * FROM test_ddl1.simple_test2 WHERE id > 2",                // ActionCreateView
+		"DROP VIEW test_ddl1.view_test2",                                                                       // ActionDropView
+		"RENAME TABLE test_ddl1.simple_test2 TO test_ddl1.simple_test5",                                        // ActionRenameTable
+		"DROP DATABASE test_ddl1",                                                                              // ActionDropSchema
+		"create database test_ddl2",                                                                            // ActionCreateSchema
+		"create table test_ddl2.simple_test1 (id bigint primary key nonclustered, c1 int not null unique key)", // ActionCreateTable
 		`CREATE TABLE test_ddl2.employees  (
 			id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			fname VARCHAR(25) NOT NULL,
@@ -860,6 +833,8 @@ func (t *schemaSuite) TestSchemaStorage(c *check.C) {
 		"alter table test_ddl2.simple_test1 add primary key pk(id)",                          // ActionAddPrimaryKey
 		"ALTER TABLE test_ddl2.simple_test1 ALTER id SET DEFAULT 18",                         // ActionSetDefaultValue
 		"ALTER TABLE test_ddl2.simple_test1 CHARACTER SET = utf8mb4",                         // ActionModifyTableCharsetAndCollate
+
+		"ALTER TABLE test_ddl2.employees REORGANIZE PARTITION p3 INTO (PARTITION p2 VALUES LESS THAN (15), PARTITION p3 VALUES LESS THAN (20))", // ActionReorganizePartition
 		// "recover table test_ddl2.employees",                                                  // ActionRecoverTable this ddl can't work on mock tikv
 
 		"DROP TABLE test_ddl2.employees",
@@ -883,45 +858,47 @@ func (t *schemaSuite) TestSchemaStorage(c *check.C) {
 
 	testOneGroup := func(tc []string) {
 		store, err := mockstore.NewMockStore()
-		c.Assert(err, check.IsNil)
+		require.Nil(t, err)
 		defer store.Close() //nolint:errcheck
 		ticonfig.UpdateGlobal(func(conf *ticonfig.Config) {
 			conf.AlterPrimaryKey = true
 		})
-		session.SetSchemaLease(0)
+		session.SetSchemaLease(time.Second)
 		session.DisableStats4Test()
 		domain, err := session.BootstrapSession(store)
-		c.Assert(err, check.IsNil)
+		require.Nil(t, err)
 		defer domain.Close()
 		domain.SetStatsUpdating(true)
-		tk := testkit.NewTestKit(c, store)
-
+		tk := testkit.NewTestKit(t, store)
+		tk.MustExec("set global tidb_enable_clustered_index = 'int_only';")
 		for _, ddlSQL := range tc {
 			tk.MustExec(ddlSQL)
 		}
 
-		jobs, err := getAllHistoryDDLJob(store)
-		c.Assert(err, check.IsNil)
-		scheamStorage, err := NewSchemaStorage(nil, 0, nil, false)
-		c.Assert(err, check.IsNil)
+		f, err := filter.NewFilter(config.GetDefaultReplicaConfig(), "")
+		require.Nil(t, err)
+
+		jobs, err := getAllHistoryDDLJob(store, f)
+		require.Nil(t, err)
+
+		schemaStorage, err := NewSchemaStorage(nil, 0, false, model.DefaultChangeFeedID("dummy"), util.RoleTester, f)
+		require.NoError(t, err)
 		for _, job := range jobs {
-			err := scheamStorage.HandleDDLJob(job)
-			c.Assert(err, check.IsNil)
+			err := schemaStorage.HandleDDLJob(job)
+			require.NoError(t, err)
 		}
 
 		for _, job := range jobs {
 			ts := job.BinlogInfo.FinishedTS
-			meta, err := kv.GetSnapshotMeta(store, ts)
-			c.Assert(err, check.IsNil)
-			snapFromMeta, err := newSchemaSnapshotFromMeta(meta, ts, false)
-			c.Assert(err, check.IsNil)
-			snapFromSchemaStore, err := scheamStorage.GetSnapshot(ctx, ts)
-			c.Assert(err, check.IsNil)
+			meta := kv.GetSnapshotMeta(store, ts)
+			snapFromMeta, err := schema.NewSnapshotFromMeta(model.DefaultChangeFeedID("test"), meta, ts, false, f)
+			require.Nil(t, err)
+			snapFromSchemaStore, err := schemaStorage.GetSnapshot(ctx, ts)
+			require.Nil(t, err)
 
-			tidySchemaSnapshot(snapFromMeta)
-			tidySchemaSnapshot(snapFromSchemaStore)
-			c.Assert(snapFromMeta, check.DeepEquals, snapFromSchemaStore,
-				check.Commentf("%s", cmp.Diff(snapFromMeta, snapFromSchemaStore, cmp.AllowUnexported(schemaSnapshot{}, model.TableInfo{}))))
+			s1 := snapFromMeta.DumpToString()
+			s2 := snapFromSchemaStore.DumpToString()
+			require.Equal(t, s1, s2)
 		}
 	}
 
@@ -930,39 +907,7 @@ func (t *schemaSuite) TestSchemaStorage(c *check.C) {
 	}
 }
 
-func tidySchemaSnapshot(snap *schemaSnapshot) {
-	for _, dbInfo := range snap.schemas {
-		if len(dbInfo.Tables) == 0 {
-			dbInfo.Tables = nil
-		}
-	}
-	for _, tableInfo := range snap.tables {
-		tableInfo.TableInfoVersion = 0
-		if len(tableInfo.Columns) == 0 {
-			tableInfo.Columns = nil
-		}
-		if len(tableInfo.Indices) == 0 {
-			tableInfo.Indices = nil
-		}
-		if len(tableInfo.ForeignKeys) == 0 {
-			tableInfo.ForeignKeys = nil
-		}
-	}
-	// the snapshot from meta doesn't know which ineligible tables that have existed in history
-	// so we delete the ineligible tables which are already not exist
-	for tableID := range snap.ineligibleTableID {
-		if _, ok := snap.tables[tableID]; !ok {
-			delete(snap.ineligibleTableID, tableID)
-		}
-	}
-	// the snapshot from meta doesn't know which tables are truncated, so we just ignore it
-	snap.truncateTableID = nil
-	for _, v := range snap.tableInSchema {
-		sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
-	}
-}
-
-func getAllHistoryDDLJob(storage tidbkv.Storage) ([]*timodel.Job, error) {
+func getAllHistoryDDLJob(storage tidbkv.Storage, f filter.Filter) ([]*timodel.Job, error) {
 	s, err := session.CreateSession(storage)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -978,11 +923,108 @@ func getAllHistoryDDLJob(storage tidbkv.Storage) ([]*timodel.Job, error) {
 		return nil, errors.Trace(err)
 	}
 	defer txn.Rollback() //nolint:errcheck
-	txnMeta := timeta.NewMeta(txn)
+	txnMeta := timeta.NewReader(txn)
 
-	jobs, err := txnMeta.GetAllHistoryDDLJobs()
+	jobs, err := ddl.GetAllHistoryDDLJobs(txnMeta)
+	res := make([]*timodel.Job, 0)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	for i, job := range jobs {
+		ignoreSchema := f.ShouldIgnoreSchema(job.SchemaName)
+		ignoreTable := f.ShouldIgnoreTable(job.SchemaName, job.TableName)
+		if ignoreSchema || ignoreTable {
+			log.Info("Ignore ddl job", zap.Stringer("job", job))
+			continue
+		}
+		// Set State from Synced to Done.
+		// Because jobs are put to history queue after TiDB alter its state from
+		// Done to Synced.
+		jobs[i].State = timodel.JobStateDone
+		res = append(res, job)
+	}
 	return jobs, nil
+}
+
+// This test is used to show how the schemaStorage choose a handleKey of a table.
+// The handleKey is chosen by the following rules:
+// 1. If the table has a primary key, the handleKey is the first column of the primary key.
+// 2. If the table has not null unique key, the handleKey is the first column of the unique key.
+// 3. If the table has no primary key and no not null unique key, it has no handleKey.
+func TestHandleKey(t *testing.T) {
+	store, err := mockstore.NewMockStore()
+	require.Nil(t, err)
+	defer store.Close() //nolint:errcheck
+
+	session.SetSchemaLease(time.Second)
+	session.DisableStats4Test()
+	domain, err := session.BootstrapSession(store)
+	require.Nil(t, err)
+	defer domain.Close()
+	domain.SetStatsUpdating(true)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("create database test2")
+	tk.MustExec("create table test.simple_test1 (id bigint primary key)")
+	tk.MustExec("create table test.simple_test2 (id bigint, age int NOT NULL, " +
+		"name char NOT NULL, UNIQUE KEY(age, name))")
+	tk.MustExec("create table test.simple_test3 (id bigint, age int)")
+	ver, err := store.CurrentVersion(oracle.GlobalTxnScope)
+	require.Nil(t, err)
+	meta := kv.GetSnapshotMeta(store, ver.Ver)
+	f, err := filter.NewFilter(config.GetDefaultReplicaConfig(), "")
+	require.Nil(t, err)
+	snap, err := schema.NewSnapshotFromMeta(model.DefaultChangeFeedID("test"), meta, ver.Ver, false, f)
+	require.Nil(t, err)
+	tb1, ok := snap.TableByName("test", "simple_test1")
+	require.True(t, ok)
+	require.Equal(t, int64(-1), tb1.HandleIndexID) // pk is handleKey
+	columnID := int64(1)
+	flag := tb1.ColumnsFlag[columnID]
+	require.True(t, flag.IsHandleKey())
+	for _, column := range tb1.Columns {
+		if column.ID == columnID {
+			require.True(t, column.Name.O == "id")
+		}
+	}
+
+	// unique key is handleKey
+	tb2, ok := snap.TableByName("test", "simple_test2")
+	require.True(t, ok)
+	require.Equal(t, int64(1), tb2.HandleIndexID)
+	columnID = int64(2)
+	flag = tb2.ColumnsFlag[columnID]
+	require.True(t, flag.IsHandleKey())
+	for _, column := range tb2.Columns {
+		if column.ID == columnID {
+			require.True(t, column.Name.O == "age")
+		}
+	}
+
+	// has no handleKey
+	tb3, ok := snap.TableByName("test", "simple_test3")
+	require.True(t, ok)
+	require.Equal(t, int64(-2), tb3.HandleIndexID)
+}
+
+func TestGetPrimaryKey(t *testing.T) {
+	helper := NewSchemaTestHelper(t)
+	defer helper.Close()
+	// PKISHandle is true, primary key is also the handle, since it's integer type.
+	sql := `create table test.t1(a int primary key, b int)`
+	event := helper.DDL2Event(sql)
+
+	names := event.TableInfo.GetPrimaryKeyColumnNames()
+	require.Equal(t, names, []string{"a"})
+
+	// IsCommonHandle is true, primary key is not the handle, since it contains multiple fields.
+	sql = `create table test.t2(a int, b int, c int, primary key(a, b))`
+	event = helper.DDL2Event(sql)
+	names = event.TableInfo.GetPrimaryKeyColumnNames()
+	require.Equal(t, names, []string{"a", "b"})
+
+	// IsCommonHandle is true, primary key is not the handle, since it's not integer type.
+	sql = `create table test.t3(a varchar(10) primary key, b int)`
+	event = helper.DDL2Event(sql)
+	names = event.TableInfo.GetPrimaryKeyColumnNames()
+	require.Equal(t, names, []string{"a"})
 }
