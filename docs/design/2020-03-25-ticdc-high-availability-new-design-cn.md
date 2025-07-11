@@ -13,7 +13,7 @@ TiCDC 高可用是指任何一个 cdc 节点挂掉，都不影响集群整体的
 
 本文总结已有代码发现的一些问题，并给出解决方案。
 
-> 注意，本文分析代码基于 [v4.0.0-beta.2](https://github.com/pingcap/ticdc/tree/v4.0.0-beta.2) 版本
+> 注意，本文分析代码基于 [v4.0.0-beta.2](https://github.com/pingcap/tiflow/tree/v4.0.0-beta.2) 版本
 
 ## 问题
 
@@ -21,9 +21,9 @@ TiCDC 高可用是指任何一个 cdc 节点挂掉，都不影响集群整体的
 
 一个 Session 是指节点与 etcd 之间维持的一种保持连接的状态。Session 中含有 Lease，并在节点存活期间保持心跳。节点挂掉后，Session 失效，与其中 Lease 关联的 Key 都被删除。这常用来服务发现中对服务节点是否存活的标识。
 
-起初，Capture 并没有使用 Session，而是仅仅在竞选 Owner 的时候创建了 Session。这样导致 Capture 挂掉后，其注册信息是无法被清理的。Capture 节点挂掉后（非正常退出），其负责的任务没有及时重新分配。这个问题在 PR [Refactor/capture watcher](https://github.com/pingcap/ticdc/pull/319) 中解决。
+起初，Capture 并没有使用 Session，而是仅仅在竞选 Owner 的时候创建了 Session。这样导致 Capture 挂掉后，其注册信息是无法被清理的。Capture 节点挂掉后（非正常退出），其负责的任务没有及时重新分配。这个问题在 PR [Refactor/capture watcher](https://github.com/pingcap/tiflow/pull/319) 中解决。
 
-另外，为了减少 RTO，我们引入了 Processor 的 Session，用来及时发现挂掉的 Processor。PR：[Reduce the RTO by watching the liveness of processors](https://github.com/pingcap/ticdc/pull/312)
+另外，为了减少 RTO，我们引入了 Processor 的 Session，用来及时发现挂掉的 Processor。PR：[Reduce the RTO by watching the liveness of processors](https://github.com/pingcap/tiflow/pull/312)
 
 因此，我们目前有三个 Session，一个是 Capture Session，用来维持 Capture 存活信息，一个是 Processor Session，用来维护 Processor 存活信息，还有一个是原来存在的 Manager Session，用来竞选 Owner。
 
@@ -77,7 +77,7 @@ Capture 创建了 ChangeFeedWatcher，然后在 160 行调用其 Watch 方法，
 
 上述 Callback 在执行一个 Processor 时调用，从而将 Processor 注册到 Capture。
 
-之所以有这样的问题，是 Watch 接口不够合理导致，Watch 没有将监控到的事件返回，而是在内部直接做了处理，这其实违背了上下层的封装原则。也就是说， Watch 只需要返回对应的事件，由 Capture 对事件作出处理，比如启动或关闭 Processor等。
+之所以有这样的问题，是 Watch 接口不够合理导致，Watch 没有将监控到的事件返回，而是在内部直接做了处理，这其实违背了上下层的封装原则。也就是说， Watch 只需要返回对应的事件，由 Capture 对事件作出处理，比如启动或关闭 Processor 等。
 
 #### Processor 的存活状态由 Owner 管理
 
@@ -137,23 +137,23 @@ Capture 在挂掉时的处理逻辑可以正常工作，但如果挂起 Capture 
 
 ### Capture 接口
 
-- New          创建 Capture 对象，并初始化
-- Serve         Capture 的核心处理流程
-- Stop          优雅退出
-- suicide        Session 失效后自杀（panic）
-- campaign      竞选 Owner，复用 Capture 自身的 Session
-- assignTask     为 Processor 分配 Task
+- New 创建 Capture 对象，并初始化
+- Serve Capture 的核心处理流程
+- Stop 优雅退出
+- suicide Session 失效后自杀（panic）
+- campaign 竞选 Owner，复用 Capture 自身的 Session
+- assignTask 为 Processor 分配 Task
 - watchProcessor 监控 Processor 的健康状况，也可以通过封装 ProcessorWatcher 来实现
-- watchTask      监控 Owner 分配的同步任务，也可以通过封装 TaskWacher 来实现
+- watchTask 监控 Owner 分配的同步任务，也可以通过封装 TaskWacher 来实现
 
 ### Owner 接口
 
-- Throne         当选 Owner 后的处理流程
-- Serve          Owner 核心逻辑
-- StepDown      退位后的处理流程
-- watchCapture   监控 Capture
-- watchJob       监控 ChangeFeed
-- assignTask      分配任务给 Capture，之后由 Capture 分配给 Processor。
+- Throne 当选 Owner 后的处理流程
+- Serve Owner 核心逻辑
+- StepDown 退位后的处理流程
+- watchCapture 监控 Capture
+- watchJob 监控 ChangeFeed
+- assignTask 分配任务给 Capture，之后由 Capture 分配给 Processor。
 
 ### ChangeFeed 定义
 
