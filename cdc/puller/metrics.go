@@ -14,108 +14,32 @@
 package puller
 
 import (
-	"time"
-
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const (
-	defaultMetricInterval = time.Second * 15
-)
+// PullerEventCounter is the counter of puller's received events
+// There are two types of events: kv (row changed event), resolved (resolved ts event).
+var PullerEventCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "ticdc",
+		Subsystem: "puller",
+		Name:      "txn_collect_event_count", // keep the old name for compatibility
+		Help:      "The number of events received by a puller",
+	}, []string{"namespace", "changefeed", "type"})
 
-var (
-	kvEventCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "kv_event_count",
-			Help:      "The number of events received from kv client event channel",
-		}, []string{"capture", "changefeed", "type"})
-	txnCollectCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "txn_collect_event_count",
-			Help:      "The number of events received from txn collector",
-		}, []string{"capture", "changefeed", "table", "type"})
-	pullerResolvedTsGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "resolved_ts",
-			Help:      "puller forward resolved ts",
-		}, []string{"capture", "changefeed", "table"})
-	outputChanSizeGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "output_chan_size",
-			Help:      "Puller entry buffer size",
-		}, []string{"capture", "changefeed", "table"})
-	memBufferSizeGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "mem_buffer_size",
-			Help:      "Puller in memory buffer size",
-		}, []string{"capture", "changefeed", "table"})
-	eventChanSizeGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "event_chan_size",
-			Help:      "Puller event channel size",
-		}, []string{"capture", "changefeed", "table"})
-	entrySorterResolvedChanSizeGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "entry_sorter_resolved_chan_size",
-			Help:      "Puller entry sorter resolved channel size",
-		}, []string{"capture", "changefeed", "table"})
-	entrySorterOutputChanSizeGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "entry_sorter_output_chan_size",
-			Help:      "Puller entry sorter output channel size",
-		}, []string{"capture", "changefeed", "table"})
-	entrySorterUnsortedSizeGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "entry_sorter_unsorted_size",
-			Help:      "Puller entry sorter unsoreted items size",
-		}, []string{"capture", "changefeed", "table"})
-	entrySorterSortDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "entry_sorter_sort",
-			Help:      "Bucketed histogram of processing time (s) of sort in entry sorter.",
-			Buckets:   prometheus.ExponentialBuckets(0.000001, 10, 10),
-		}, []string{"capture", "changefeed", "table"})
-	entrySorterMergeDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: "ticdc",
-			Subsystem: "puller",
-			Name:      "entry_sorter_merge",
-			Help:      "Bucketed histogram of processing time (s) of merge in entry sorter.",
-			Buckets:   prometheus.ExponentialBuckets(0.000001, 10, 10),
-		}, []string{"capture", "changefeed", "table"})
-)
+var pullerQueueDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Namespace: "ticdc",
+		Subsystem: "puller",
+		Name:      "queue_duration",
+		Help:      "time of queue in puller",
+		Buckets:   prometheus.ExponentialBuckets(1, 2, 20),
+	},
+	// types : kv, resolved.
+	[]string{"namespace", "changefeed", "type"})
 
 // InitMetrics registers all metrics in this file
 func InitMetrics(registry *prometheus.Registry) {
-	registry.MustRegister(kvEventCounter)
-	registry.MustRegister(txnCollectCounter)
-	registry.MustRegister(pullerResolvedTsGauge)
-	registry.MustRegister(memBufferSizeGauge)
-	registry.MustRegister(outputChanSizeGauge)
-	registry.MustRegister(eventChanSizeGauge)
-	registry.MustRegister(entrySorterResolvedChanSizeGauge)
-	registry.MustRegister(entrySorterOutputChanSizeGauge)
-	registry.MustRegister(entrySorterUnsortedSizeGauge)
-	registry.MustRegister(entrySorterSortDuration)
-	registry.MustRegister(entrySorterMergeDuration)
+	registry.MustRegister(PullerEventCounter)
+	registry.MustRegister(pullerQueueDuration)
 }

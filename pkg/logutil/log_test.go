@@ -15,54 +15,55 @@ package logutil
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
+	"net"
+	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest"
 )
 
-func TestSuite(t *testing.T) {
-	check.TestingT(t)
-}
+func TestInitLoggerAndSetLogLevel(t *testing.T) {
+	f, err := os.CreateTemp("", "init-logger-test")
+	require.Nil(t, err)
+	defer os.Remove(f.Name())
 
-type logSuite struct{}
-
-var _ = check.Suite(&logSuite{})
-
-func (s *logSuite) TestInitLoggerAndSetLogLevel(c *check.C) {
-	defer testleak.AfterTest(c)()
-	f := filepath.Join(c.MkDir(), "test")
 	cfg := &Config{
 		Level: "warning",
-		File:  f,
+		File:  f.Name(),
 	}
 	cfg.Adjust()
-	err := InitLogger(cfg)
-	c.Assert(err, check.IsNil)
-	c.Assert(log.GetLevel(), check.Equals, zapcore.WarnLevel)
+	err = InitLogger(cfg)
+	require.NoError(t, err)
+	require.Equal(t, log.GetLevel(), zapcore.WarnLevel)
 
 	// Set a different level.
 	err = SetLogLevel("info")
-	c.Assert(err, check.IsNil)
-	c.Assert(log.GetLevel(), check.Equals, zapcore.InfoLevel)
+	require.NoError(t, err)
+	require.Equal(t, log.GetLevel(), zapcore.InfoLevel)
 
 	// Set the same level.
 	err = SetLogLevel("info")
-	c.Assert(err, check.IsNil)
-	c.Assert(log.GetLevel(), check.Equals, zapcore.InfoLevel)
+	require.NoError(t, err)
+	require.Equal(t, log.GetLevel(), zapcore.InfoLevel)
 
 	// Set an invalid level.
 	err = SetLogLevel("badlevel")
-	c.Assert(err, check.NotNil)
+	require.Error(t, err)
 }
 
-func (s *logSuite) TestZapErrorFilter(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestZapErrorFilter(t *testing.T) {
 	var (
 		err       = errors.New("test error")
 		testCases = []struct {
@@ -79,6 +80,166 @@ func (s *logSuite) TestZapErrorFilter(c *check.C) {
 		}
 	)
 	for _, tc := range testCases {
-		c.Assert(ZapErrorFilter(tc.err, tc.filters...), check.DeepEquals, tc.expected)
+		require.Equal(t, ZapErrorFilter(tc.err, tc.filters...), tc.expected)
 	}
+}
+
+func TestZapInternalErrorOutput(t *testing.T) {
+	testCases := []struct {
+		desc      string
+		errOutput string
+		error     bool
+	}{
+		{"test valid error output path", "stderr", false},
+		{"test invalid error output path", filepath.Join(t.TempDir(), "/not-there/foo.log"), true},
+	}
+
+	dir := t.TempDir()
+	for idx, tc := range testCases {
+		f := filepath.Join(dir, fmt.Sprintf("test-file%d", idx))
+		cfg := &Config{
+			Level:                "info",
+			File:                 f,
+			ZapInternalErrOutput: tc.errOutput,
+		}
+		err := InitLogger(cfg)
+		if tc.error {
+			require.NotNil(t, err)
+		} else {
+			require.Nil(t, err)
+		}
+	}
+}
+
+func TestErrorFilterContextCanceled(t *testing.T) {
+	var buffer zaptest.Buffer
+	err := InitLogger(&Config{Level: "info"}, WithOutputWriteSyncer(&buffer))
+	require.NoError(t, err)
+
+	ErrorFilterContextCanceled(log.L(), "the message", zap.Int("number", 123456),
+		zap.Ints("array", []int{7, 8, 9}), zap.Error(context.Canceled))
+	require.Equal(t, "", buffer.Stripped())
+	buffer.Reset()
+
+	ErrorFilterContextCanceled(log.L(), "the message", zap.Int("number", 123456),
+		zap.Ints("array", []int{7, 8, 9}),
+		ShortError(errors.Annotate(context.Canceled, "extra info")))
+	require.Equal(t, "", buffer.Stripped())
+	buffer.Reset()
+
+	ErrorFilterContextCanceled(log.L(), "the message", zap.Int("number", 123456),
+		zap.Ints("array", []int{7, 8, 9}))
+	require.Regexp(t, regexp.QuoteMeta("[\"the message\"]"+
+		" [number=123456] [array=\"[7,8,9]\"]"), buffer.Stripped())
+}
+
+func TestShortError(t *testing.T) {
+	var buffer zaptest.Buffer
+	err := InitLogger(&Config{Level: "info"}, WithOutputWriteSyncer(&buffer))
+	require.NoError(t, err)
+
+	err = errors.Normalize(
+		"meta not exists in region",
+		errors.RFCCodeText("CDC:ErrMetaNotInRegion"),
+	).GenWithStackByArgs("extra info")
+	log.L().Warn("short error", ShortError(err))
+	require.Regexp(t, regexp.QuoteMeta("[\"short error\"] "+
+		"[error=\"[CDC:ErrMetaNotInRegion]meta not exists in region"), buffer.Stripped())
+	buffer.Reset()
+
+	log.L().Warn("short error", ShortError(nil))
+	require.Regexp(t, regexp.QuoteMeta("[\"short error\"] []"), buffer.Stripped())
+	buffer.Reset()
+
+	log.L().Warn("short error", zap.Error(err))
+	require.Regexp(t, regexp.QuoteMeta("errors.AddStack"), buffer.Stripped())
+	buffer.Reset()
+}
+
+func TestLoggerOption(t *testing.T) {
+	t.Parallel()
+
+	var op loggerOp
+	require.False(t, op.isInitGRPCLogger)
+	require.False(t, op.isInitSaramaLogger)
+	require.Nil(t, op.output)
+
+	op.applyOpts([]LoggerOpt{WithInitGRPCLogger(), WithInitSaramaLogger()})
+	require.True(t, op.isInitGRPCLogger)
+	require.True(t, op.isInitSaramaLogger)
+	require.Nil(t, op.output)
+
+	var buffer zaptest.Buffer
+	op.applyOpts([]LoggerOpt{WithOutputWriteSyncer(&buffer)})
+	require.Equal(t, &buffer, op.output)
+}
+
+func TestWithComponent(t *testing.T) {
+	var buffer zaptest.Buffer
+	err := InitLogger(&Config{Level: "info"}, WithOutputWriteSyncer(&buffer))
+	require.NoError(t, err)
+
+	lg := WithComponent("grpc")
+	lg.Warn("component test", zap.String("other", "other"))
+	require.Regexp(t, regexp.QuoteMeta("[\"component test\"] [component=grpc] [other=other]"), buffer.Stripped())
+	buffer.Reset()
+}
+
+func TestCallerSkip(t *testing.T) {
+	// Using log before init logger should not affect
+	// any other log after init logger.
+	//
+	// See https://github.com/pingcap/log/issues/30.
+	log.Debug("debug")
+	log.L().Debug("debug")
+
+	var buffer zaptest.Buffer
+	err := InitLogger(&Config{Level: "info"}, WithOutputWriteSyncer(&buffer))
+	require.NoError(t, err)
+
+	_, file, line, _ := runtime.Caller(0)
+	_, filename := filepath.Split(file)
+	log.Info("caller skip test", zap.String("other", "other"))
+	require.Contains(t, buffer.Stripped(), fmt.Sprintf("%s:%d", filename, line+2))
+
+	buffer.Reset()
+	_, file, line, _ = runtime.Caller(0)
+	_, filename = filepath.Split(file)
+	log.L().Info("caller skip test", zap.String("other", "other"))
+	require.Contains(t, buffer.Stripped(), fmt.Sprintf("%s:%d", filename, line+2))
+}
+
+func TestMySQLLogger(t *testing.T) {
+	var buffer zaptest.Buffer
+	err := InitLogger(&Config{Level: "info"}, WithOutputWriteSyncer(&buffer))
+	require.NoError(t, err)
+
+	require.Nil(t, initMySQLLogger())
+
+	// Mock MySQL server
+	ms, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := ms.Accept()
+		require.NoError(t, err)
+		err = conn.Close()
+		require.NoError(t, err)
+	}()
+
+	dsnStr := fmt.Sprintf("root:@tcp(%s)/", ms.Addr().String())
+	db, err := sql.Open("mysql", dsnStr)
+	require.Nil(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = db.PingContext(ctx)
+	require.Error(t, err)
+	// Log: [ERROR] [packets.go:37] ["unexpected EOF"] [component="[mysql]"]
+	require.Contains(t, buffer.Stripped(), "[ERROR]")
+	require.Contains(t, buffer.Stripped(), "packets.go")
+	require.Contains(t, buffer.Stripped(), "unexpected EOF")
+	require.Contains(t, buffer.Stripped(), "[mysql]")
+	wg.Wait()
 }
