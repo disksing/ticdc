@@ -19,14 +19,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pingcap/log"
-
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	cerrors "github.com/pingcap/ticdc/pkg/errors"
-	"github.com/pingcap/ticdc/pkg/notify"
+	"github.com/pingcap/log"
+	cerrors "github.com/pingcap/tiflow/pkg/errors"
+	"github.com/pingcap/tiflow/pkg/notify"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -89,11 +89,19 @@ func (p *defaultPoolImpl) RegisterEvent(f func(ctx context.Context, event interf
 	return handler
 }
 
+type handleStatus = int32
+
+const (
+	handleRunning = handleStatus(iota)
+	handleCancelling
+	handleCancelled
+)
+
 type defaultEventHandle struct {
 	// the function to be run each time the event is triggered
 	f func(ctx context.Context, event interface{}) error
-	// whether this handle has been cancelled, must be accessed atomically
-	isCancelled int32
+	// must be accessed atomically
+	status handleStatus
 	// channel for the error returned by f
 	errCh chan error
 	// the worker that the handle is associated with
@@ -119,22 +127,46 @@ type defaultEventHandle struct {
 }
 
 func (h *defaultEventHandle) AddEvent(ctx context.Context, event interface{}) error {
-	if atomic.LoadInt32(&h.isCancelled) == 1 {
+	status := atomic.LoadInt32(&h.status)
+	if status != handleRunning {
 		return cerrors.ErrWorkerPoolHandleCancelled.GenWithStackByArgs()
 	}
 
 	failpoint.Inject("addEventDelayPoint", func() {})
 
-	task := &task{
+	task := task{
 		handle: h,
 		f: func(ctx1 context.Context) error {
-			// Here we merge the context passed down from WorkerPool.Run,
-			// with the context supplied by AddEvent,
-			// because we want operations to be cancellable by both contexts.
-			mContext, cancel := MergeContexts(ctx, ctx1)
-			// this cancels the merged context only.
-			defer cancel()
-			return h.f(mContext, event)
+			return h.f(ctx, event)
+		},
+	}
+
+	select {
+	case <-ctx.Done():
+		return errors.Trace(ctx.Err())
+	case h.worker.taskCh <- task:
+	}
+	return nil
+}
+
+func (h *defaultEventHandle) AddEvents(ctx context.Context, events []interface{}) error {
+	status := atomic.LoadInt32(&h.status)
+	if status != handleRunning {
+		return cerrors.ErrWorkerPoolHandleCancelled.GenWithStackByArgs()
+	}
+
+	failpoint.Inject("addEventDelayPoint", func() {})
+
+	task := task{
+		handle: h,
+		f: func(ctx1 context.Context) error {
+			for _, event := range events {
+				err := h.f(ctx, event)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 
@@ -154,9 +186,7 @@ func (h *defaultEventHandle) SetTimer(ctx context.Context, interval time.Duratio
 
 	h.timerInterval = interval
 	h.timerHandler = func(ctx1 context.Context) error {
-		mContext, cancel := MergeContexts(ctx, ctx1)
-		defer cancel()
-		return f(mContext)
+		return f(ctx)
 	}
 	// mark the timer handler function as valid
 	atomic.StoreInt32(&h.hasTimer, 1)
@@ -165,7 +195,10 @@ func (h *defaultEventHandle) SetTimer(ctx context.Context, interval time.Duratio
 }
 
 func (h *defaultEventHandle) Unregister() {
-	if !atomic.CompareAndSwapInt32(&h.isCancelled, 0, 1) {
+	if !atomic.CompareAndSwapInt32(&h.status, handleRunning, handleCancelled) {
+		// call synchronize so that the returning of Unregister cannot race
+		// with the calling of the errorHandler, if an error is already being processed.
+		h.worker.synchronize()
 		// already cancelled
 		return
 	}
@@ -177,6 +210,46 @@ func (h *defaultEventHandle) Unregister() {
 	h.worker.synchronize()
 
 	h.doCancel(cerrors.ErrWorkerPoolHandleCancelled.GenWithStackByArgs())
+}
+
+func (h *defaultEventHandle) GracefulUnregister(ctx context.Context, timeout time.Duration) error {
+	if !atomic.CompareAndSwapInt32(&h.status, handleRunning, handleCancelling) {
+		// already cancelling or cancelled
+		return nil
+	}
+
+	defer func() {
+		if !atomic.CompareAndSwapInt32(&h.status, handleCancelling, handleCancelled) {
+			// already cancelled
+			return
+		}
+
+		// call synchronize so that all function executions related to this handle will be
+		// linearized BEFORE Unregister.
+		h.worker.synchronize()
+		h.doCancel(cerrors.ErrWorkerPoolHandleCancelled.GenWithStackByArgs())
+	}()
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	doneCh := make(chan struct{})
+	select {
+	case <-ctx.Done():
+		return cerrors.ErrWorkerPoolGracefulUnregisterTimedOut.GenWithStackByArgs()
+	case h.worker.taskCh <- task{
+		handle: h,
+		doneCh: doneCh,
+	}:
+	}
+
+	select {
+	case <-ctx.Done():
+		return cerrors.ErrWorkerPoolGracefulUnregisterTimedOut.GenWithStackByArgs()
+	case <-doneCh:
+	}
+
+	return nil
 }
 
 // callers of doCancel need to check h.isCancelled first.
@@ -209,7 +282,7 @@ func (h *defaultEventHandle) HashCode() int64 {
 }
 
 func (h *defaultEventHandle) cancelWithErr(err error) {
-	if !atomic.CompareAndSwapInt32(&h.isCancelled, 0, 1) {
+	if !atomic.CompareAndSwapInt32(&h.status, handleRunning, handleCancelled) {
 		// already cancelled
 		return
 	}
@@ -243,10 +316,12 @@ func (h *defaultEventHandle) doTimer(ctx context.Context) error {
 type task struct {
 	handle *defaultEventHandle
 	f      func(ctx context.Context) error
+
+	doneCh chan struct{} // only used in implementing GracefulUnregister
 }
 
 type worker struct {
-	taskCh       chan *task
+	taskCh       chan task
 	handles      map[*defaultEventHandle]struct{}
 	handleRWLock sync.RWMutex
 	// A message is passed to handleCancelCh when we need to wait for the
@@ -256,13 +331,19 @@ type worker struct {
 	isRunning int32
 	// notifies exits of run()
 	stopNotifier notify.Notifier
+
+	slowSynchronizeThreshold time.Duration
+	slowSynchronizeLimiter   *rate.Limiter
 }
 
 func newWorker() *worker {
 	return &worker{
-		taskCh:         make(chan *task, 128),
+		taskCh:         make(chan task, 128),
 		handles:        make(map[*defaultEventHandle]struct{}),
 		handleCancelCh: make(chan struct{}), // this channel must be unbuffered, i.e. blocking
+
+		slowSynchronizeThreshold: 10 * time.Second,
+		slowSynchronizeLimiter:   rate.NewLimiter(rate.Every(time.Second*5), 1),
 	}
 }
 
@@ -280,11 +361,16 @@ func (w *worker) run(ctx context.Context) error {
 		case <-ctx.Done():
 			return errors.Trace(ctx.Err())
 		case task := <-w.taskCh:
-			if task == nil {
-				return cerrors.ErrWorkerPoolEmptyTask.GenWithStackByArgs()
-			}
-			if atomic.LoadInt32(&task.handle.isCancelled) == 1 {
+			if atomic.LoadInt32(&task.handle.status) == handleCancelled {
 				// ignored cancelled handle
+				continue
+			}
+
+			if task.doneCh != nil {
+				close(task.doneCh)
+				if task.f != nil {
+					log.L().DPanic("unexpected message handler func in cancellation task", zap.Stack("stack"))
+				}
 				continue
 			}
 
@@ -300,7 +386,7 @@ func (w *worker) run(ctx context.Context) error {
 
 			w.handleRWLock.RLock()
 			for handle := range w.handles {
-				if atomic.LoadInt32(&handle.isCancelled) == 1 {
+				if atomic.LoadInt32(&handle.status) == handleCancelled {
 					// ignored cancelled handle
 					continue
 				}
@@ -351,12 +437,19 @@ func (w *worker) synchronize() {
 			break
 		}
 
-		if time.Since(startTime) > time.Second*10 {
-			// likely the workerpool has deadlocked, or there is a bug in the event handlers.
-			log.Warn("synchronize is taking too long, report a bug", zap.Duration("elapsed", time.Since(startTime)))
+		if time.Since(startTime) > w.slowSynchronizeThreshold &&
+			w.slowSynchronizeLimiter.Allow() {
+			// likely the workerpool has deadlocked, or there is a bug
+			// in the event handlers.
+			logWarn("synchronize is taking too long, report a bug",
+				zap.Duration("duration", time.Since(startTime)),
+				zap.Stack("stacktrace"))
 		}
 	}
 }
+
+// A delegate to log.Warn. It exists only for testing.
+var logWarn = log.Warn
 
 func (w *worker) addHandle(handle *defaultEventHandle) {
 	w.handleRWLock.Lock()

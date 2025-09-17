@@ -14,12 +14,15 @@
 package util
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	cerror "github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/log"
+	tiTypes "github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/timeutil"
+	cerror "github.com/pingcap/tiflow/pkg/errors"
+	"go.uber.org/zap"
 )
 
 // GetTimezone returns the timezone specified by the name
@@ -28,14 +31,25 @@ func GetTimezone(name string) (tz *time.Location, err error) {
 	case "", "system", "local":
 		tz, err = GetLocalTimezone()
 		err = cerror.WrapError(cerror.ErrLoadTimezone, err)
+		if err == nil {
+			log.Info("Use the timezone of the TiCDC server machine",
+				zap.String("timezoneName", name),
+				zap.String("timezone", tz.String()))
+		}
 	default:
 		tz, err = time.LoadLocation(name)
 		err = cerror.WrapError(cerror.ErrLoadTimezone, err)
+		if err == nil {
+			log.Info("Load the timezone specified by the user",
+				zap.String("timezoneName", name),
+				zap.String("timezone", tz.String()))
+		}
 	}
 	return
 }
 
-func getTimezoneFromZonefile(zonefile string) (tz *time.Location, err error) {
+// GetTimezoneFromZonefile read the timezone from file
+func GetTimezoneFromZonefile(zonefile string) (tz *time.Location, err error) {
 	// the linked path of `/etc/localtime` sample:
 	// MacOS: /var/db/timezone/zoneinfo/Asia/Shanghai
 	// Linux: /usr/share/zoneinfo/Asia/Shanghai
@@ -57,9 +71,42 @@ func GetLocalTimezone() (*time.Location, error) {
 	if time.Local.String() != "Local" {
 		return time.Local, nil
 	}
-	str, err := os.Readlink("/etc/localtime")
-	if err != nil {
-		return nil, cerror.WrapError(cerror.ErrLoadTimezone, err)
+	str := timeutil.InferSystemTZ()
+	return GetTimezoneFromZonefile(str)
+}
+
+// GetTimeZoneName returns the timezone name in a time.Location.
+func GetTimeZoneName(tz *time.Location) string {
+	if tz == nil {
+		return ""
 	}
-	return getTimezoneFromZonefile(str)
+	return tz.String()
+}
+
+// ConvertTimezone converts the timestamp to the specified timezone
+func ConvertTimezone(timestamp string, location string) (string, error) {
+	t, err := tiTypes.ParseTimestamp(tiTypes.StrictContext, timestamp)
+	if err != nil {
+		return "", err
+	}
+
+	var tz *time.Location
+	switch strings.ToLower(location) {
+	case "", "system", "local":
+		tz, err = GetLocalTimezone()
+	default:
+		tz, err = time.LoadLocation(location)
+	}
+	if err != nil {
+		log.Info("cannot load timezone location",
+			zap.String("location", location), zap.Error(err))
+		return "", err
+	}
+
+	err = t.ConvertTimeZone(tz, time.UTC)
+	if err != nil {
+		return "", err
+	}
+
+	return t.String(), nil
 }

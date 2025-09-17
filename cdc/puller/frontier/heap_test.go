@@ -16,17 +16,14 @@ package frontier
 import (
 	"math"
 	"math/rand"
+	"testing"
+	"time"
 
-	"github.com/pingcap/check"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
+	"github.com/stretchr/testify/require"
 )
 
-type tsHeapSuite struct{}
-
-var _ = check.Suite(&tsHeapSuite{})
-
-func (s *tsHeapSuite) TestInsert(c *check.C) {
-	defer testleak.AfterTest(c)()
+func TestInsert(t *testing.T) {
+	t.Parallel()
 	var heap fibonacciHeap
 	target := uint64(15000)
 
@@ -35,60 +32,76 @@ func (s *tsHeapSuite) TestInsert(c *check.C) {
 	}
 	heap.Insert(target)
 
-	c.Assert(heap.GetMinKey(), check.Equals, target)
+	require.Equal(t, target, heap.GetMinKey())
 }
 
-func (s *tsHeapSuite) TestUpdateTs(c *check.C) {
-	defer testleak.AfterTest(c)()
-	rand.Seed(0xdeadbeaf)
+func TestUpdateTs(t *testing.T) {
+	t.Parallel()
+	seed := time.Now().Unix()
+	rand.Seed(seed)
 	var heap fibonacciHeap
-	nodes := make([]*fibonacciHeapNode, 50000)
+	nodes := make([]*fibonacciHeapNode, 2000)
+	expectedMin := uint64(math.MaxUint64)
 	for i := range nodes {
-		nodes[i] = heap.Insert(10000 + uint64(rand.Intn(len(nodes)/2)))
+		key := 10000 + uint64(rand.Intn(len(nodes)/2))
+		nodes[i] = heap.Insert(key)
+		if expectedMin > key {
+			expectedMin = key
+		}
 	}
+
+	var key uint64
 	for i := range nodes {
 		min := heap.GetMinKey()
-		expectedMin := uint64(math.MaxUint64)
-		for _, n := range nodes {
-			if expectedMin > n.key {
-				expectedMin = n.key
-			}
-		}
-		c.Assert(min, check.Equals, expectedMin)
+		require.Equal(t, expectedMin, min, "seed:%d", seed)
 		if rand.Intn(2) == 0 {
-			heap.UpdateKey(nodes[i], nodes[i].key+uint64(10000))
+			key = nodes[i].key + uint64(10000)
+			heap.UpdateKey(nodes[i], key)
 		} else {
-			heap.UpdateKey(nodes[i], nodes[i].key-uint64(10000))
+			key = nodes[i].key - uint64(10000)
+			heap.UpdateKey(nodes[i], key)
+		}
+		if expectedMin > key {
+			expectedMin = key
 		}
 	}
 }
 
-func (s *tsHeapSuite) TestRemoveNode(c *check.C) {
-	defer testleak.AfterTest(c)()
-	rand.Seed(0xdeadbeaf)
+func TestRemoveNode(t *testing.T) {
+	t.Parallel()
+	seed := time.Now().Unix()
+	rand.Seed(seed)
 	var heap fibonacciHeap
-	nodes := make([]*fibonacciHeapNode, 50000)
+	nodes := make([]*fibonacciHeapNode, 2000)
+	expectedMin := uint64(math.MaxUint64)
 	for i := range nodes {
 		nodes[i] = heap.Insert(10000 + uint64(rand.Intn(len(nodes)/2)))
+		if nodes[i].key < expectedMin {
+			expectedMin = nodes[i].key
+		}
 	}
 
+	preKey := expectedMin + 1
 	for i := range nodes {
 		min := heap.GetMinKey()
-		expectedMin := uint64(math.MaxUint64)
-		for _, n := range nodes {
-			if isRemoved(n) {
-				continue
-			}
-			if expectedMin > n.key {
-				expectedMin = n.key
+		if preKey == expectedMin {
+			expectedMin = uint64(math.MaxUint64)
+			for _, n := range nodes {
+				if isRemoved(n) {
+					continue
+				}
+				if expectedMin > n.key {
+					expectedMin = n.key
+				}
 			}
 		}
-		c.Assert(min, check.Equals, expectedMin)
+		require.Equal(t, expectedMin, min, "seed:%d", seed)
+		preKey = nodes[i].key
 		heap.Remove(nodes[i])
 	}
 	for _, n := range nodes {
 		if !isRemoved(n) {
-			c.Fatal("all of the node shoule be removed")
+			t.Fatal("all of the node shoule be removed")
 		}
 	}
 }

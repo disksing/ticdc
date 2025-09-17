@@ -15,10 +15,11 @@ package version
 
 import (
 	"fmt"
+	"runtime"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/pkg/util"
+	"github.com/pingcap/tiflow/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -28,13 +29,12 @@ var (
 	BuildTS        = "None"
 	GitHash        = "None"
 	GitBranch      = "None"
-	GoVersion      = "None"
 )
 
 // ReleaseSemver returns a valid Semantic Versions or an empty if the
 // ReleaseVersion is not set at compile time.
 func ReleaseSemver() string {
-	s := removeVAndHash(ReleaseVersion)
+	s := SanitizeVersion(ReleaseVersion)
 	v, err := semver.NewVersion(s)
 	if err != nil {
 		return ""
@@ -43,13 +43,13 @@ func ReleaseSemver() string {
 }
 
 // LogVersionInfo prints the CDC version information.
-func LogVersionInfo() {
-	log.Info("Welcome to Change Data Capture (CDC)",
+func LogVersionInfo(app string) {
+	log.Info("Welcome to "+app,
 		zap.String("release-version", ReleaseVersion),
 		zap.String("git-hash", GitHash),
 		zap.String("git-branch", GitBranch),
 		zap.String("utc-build-time", BuildTS),
-		zap.String("go-version", GoVersion),
+		zap.String("go-version", runtime.Version()),
 		zap.Bool("failpoint-build", util.FailpointBuild),
 	)
 }
@@ -61,7 +61,7 @@ func GetRawInfo() string {
 	info += fmt.Sprintf("Git Commit Hash: %s\n", GitHash)
 	info += fmt.Sprintf("Git Branch: %s\n", GitBranch)
 	info += fmt.Sprintf("UTC Build Time: %s\n", BuildTS)
-	info += fmt.Sprintf("Go Version: %s\n", GoVersion)
+	info += fmt.Sprintf("Go Version: %s\n", runtime.Version())
 	info += fmt.Sprintf("Failpoint Build: %t\n", util.FailpointBuild)
 	return info
 }

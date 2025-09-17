@@ -14,27 +14,62 @@
 package model
 
 import (
-	"github.com/pingcap/check"
-	"github.com/pingcap/ticdc/pkg/util/testleak"
+	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
-type captureSuite struct{}
+func TestMarshalUnmarshal(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&captureSuite{})
-
-func (s *captureSuite) TestMarshalUnmarshal(c *check.C) {
-	defer testleak.AfterTest(c)()
 	info := &CaptureInfo{
 		ID:            "9ff52aca-aea6-4022-8ec4-fbee3f2c7890",
 		AdvertiseAddr: "127.0.0.1:8300",
 		Version:       "dev",
 	}
-	expected := `{"id":"9ff52aca-aea6-4022-8ec4-fbee3f2c7890","address":"127.0.0.1:8300","version":"dev"}`
+	expected := `{"id":"9ff52aca-aea6-4022-8ec4-fbee3f2c7890","address":"127.0.0.1:8300",` +
+		`"version":"dev","git-hash":"","deploy-path":"","start-timestamp":0}`
 	data, err := info.Marshal()
-	c.Assert(err, check.IsNil)
-	c.Assert(string(data), check.Equals, expected)
+	require.Nil(t, err)
+	require.Equal(t, expected, string(data))
 	decodedInfo := &CaptureInfo{}
 	err = decodedInfo.Unmarshal(data)
-	c.Assert(err, check.IsNil)
-	c.Assert(decodedInfo, check.DeepEquals, info)
+	require.Nil(t, err)
+	require.Equal(t, info, decodedInfo)
+
+	// test marshal and unmarshal all fileds
+	info = &CaptureInfo{
+		ID:             "9ff52aca-aea6-4022-8ec4-fbee3f2c7890",
+		AdvertiseAddr:  "127.0.0.1:8300",
+		Version:        "dev",
+		GitHash:        "1234567890",
+		DeployPath:     "/tmp/tiflow",
+		StartTimestamp: 1234567890,
+	}
+	expected = `{"id":"9ff52aca-aea6-4022-8ec4-fbee3f2c7890","address":"127.0.0.1:8300",` +
+		`"version":"dev","git-hash":"1234567890","deploy-path":"/tmp/tiflow","start-timestamp":1234567890}`
+	data, err = info.Marshal()
+	require.Nil(t, err)
+	require.Equal(t, expected, string(data))
+	decodedInfo = &CaptureInfo{}
+	err = decodedInfo.Unmarshal(data)
+	require.Nil(t, err)
+	require.Equal(t, info, decodedInfo)
+}
+
+func TestListVersionsFromCaptureInfos(t *testing.T) {
+	infos := []*CaptureInfo{
+		{
+			ID:            "9ff52aca-aea6-4022-8ec4-fbee3f2c7891",
+			AdvertiseAddr: "127.0.0.1:8300",
+			Version:       "dev",
+		},
+		{
+			ID:            "9ff52aca-aea6-4022-8ec4-fbee3f2c7891",
+			AdvertiseAddr: "127.0.0.1:8300",
+			Version:       "",
+		},
+	}
+
+	require.ElementsMatch(t, []string{"dev", ""}, ListVersionsFromCaptureInfos(infos))
 }

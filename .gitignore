@@ -20,7 +20,6 @@ _cgo_export.*
 _testmain.go
 
 *.exe
-*.test
 *.prof
 *.log
 
@@ -30,6 +29,8 @@ bin
 .DS_Store
 .devcontainer
 .vscode
+vendor
+.python-version
 
 cscope.*
 **/*.swp
@@ -40,10 +41,33 @@ cmd/cdc/cdc
 tiflash-config-preprocessed.toml
 
 # Files generated when running docker-compose
-docker/data
-docker/logs
+deployments/ticdc/docker-compose/data
+deployments/ticdc/docker-compose/logs
 
 # Binary file when running intergration test
 integration/integration
 
 *.tmp
+
+# DM related files
+/dm/monitoring/dashboards/*.json
+/dm/monitoring/rules/dm_worker.rules.yml
+syncer.meta
+relay_log/*
+dumped_data/*
+*-coverage.xml
+*-junit-report.xml
+dm/ui/dist
+dm/ui/src/routes.tsx
+dm/ui/src/mock.ts
+dm/ui/stats.html
+
+# npm dependencies
+node_modules
+
+tools/bin
+tools/include
+
+docs/package-lock.json
+docs/node_modules
+docs/package.json
